@@ -26,6 +26,50 @@ def main():
     cfg = load_config(args.config)
     log = setup_logging(cfg.get("output", {}).get("log_level", "INFO"))
 
+    # GPU status check at startup
+    try:
+        import torch
+
+        cuda_avail = torch.cuda.is_available()
+        if cuda_avail:
+            dev_count = torch.cuda.device_count()
+            dev_name = torch.cuda.get_device_name(0)
+            dev_cap = torch.cuda.get_device_capability(0)
+            log.info(
+                "[GPU] torch CUDA available: True device_count=%d device0=%s capability=%s torch=%s cuda_runtime=%s",
+                dev_count,
+                dev_name,
+                dev_cap,
+                torch.__version__,
+                torch.version.cuda,
+            )
+        else:
+            log.warning(
+                "[GPU] torch CUDA available: False torch=%s — detector will fall back to CPU. Check torch install with CUDA wheel and NVIDIA driver >=528.",
+                torch.__version__,
+            )
+    except Exception as e:
+        log.warning("[GPU] torch check failed: %s", e)
+
+    try:
+        import onnxruntime as ort
+
+        providers = ort.get_available_providers()
+        log.info(
+            "[GPU] onnxruntime %s providers available: %s", ort.__version__, providers
+        )
+        if (
+            "CUDAExecutionProvider" not in providers
+            and "TensorrtExecutionProvider" not in providers
+        ):
+            log.warning(
+                "[GPU] onnxruntime GPU providers NOT found — OCR will run on CPU. Uninstall onnxruntime and pip install onnxruntime-gpu==1.18.1 with CUDA 12 feed. See README troubleshooting."
+            )
+        else:
+            log.info("[GPU] onnxruntime GPU provider found — OCR should use GPU")
+    except Exception as e:
+        log.warning("[GPU] onnxruntime check failed: %s", e)
+
     cap_cfg = cfg["capture"]
     det_cfg = cfg["detector"]
     trk_cfg = cfg["tracker"]

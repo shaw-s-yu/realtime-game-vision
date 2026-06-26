@@ -37,24 +37,66 @@ class OCRProcessor:
         self.diff_threshold = diff_threshold
         self.prev_texts = set()
         self.lang = lang
+        self.use_gpu = use_gpu
         if self.enabled:
             try:
                 # RapidOCR auto-selects GPU via onnxruntime if available
-                # Try new API with lang parameter, fallback to old API
-                try:
-                    self.ocr = RapidOCR(lang=lang)
-                except TypeError:
-                    # older rapidocr_onnxruntime uses different param names or defaults to Chinese
+                # Try multiple API signatures across rapidocr versions to force GPU and lang
+                ocr_obj = None
+                last_err = None
+                # candidate kwargs in order of likelihood across versions
+                candidates = [
+                    {"lang": lang, "device": "cuda" if use_gpu else "cpu"},
+                    {"lang": lang, "use_cuda": use_gpu},
+                    {"lang": lang, "use_gpu": use_gpu},
+                    {"lang": lang},
+                    {"device": "cuda" if use_gpu else "cpu"},
+                    {"use_cuda": use_gpu},
+                    {},
+                ]
+                for kw in candidates:
                     try:
-                        # Try explicit model config for Chinese + English
-                        from rapidocr_onnxruntime import RapidOCR as RO
+                        ocr_obj = RapidOCR(**kw)
+                        break
+                    except TypeError as te:
+                        last_err = te
+                        continue
+                    except Exception as e:
+                        last_err = e
+                        continue
+                if ocr_obj is None:
+                    raise RuntimeError(f"RapidOCR init failed with all signatures, last error: {last_err}")
+                self.ocr = ocr_obj
+                print(f"[ocr] RapidOCR initialized lang={lang} use_gpu={use_gpu}")
 
-                        # RapidOCR default models support Chinese. For English-only user would set lang=en in config.
-                        # We attempt lang first, then fallback to default.
-                        self.ocr = RO()
-                    except Exception:
-                        self.ocr = RapidOCR()
-                print(f"[ocr] RapidOCR initialized lang={lang}")
+                # Log which onnx providers RapidOCR actually ended up using
+                try:
+                    import onnxruntime as ort
+                    prov = ort.get_available_providers()
+                    print(f"[ocr] onnxruntime available providers: {prov}")
+                    # Try to inspect internal sessions if accessible
+                    sess_providers = []
+                    for attr in ["text_det", "text_rec", "text_cls", "det", "rec", "cls"]:
+                        try:
+                            obj = getattr(self.ocr, attr, None)
+                            if obj and hasattr(obj, "session"):
+                                sess_providers.append(obj.session.get_providers())
+                            elif obj and hasattr(obj, "rec") and hasattr(obj.rec, "session"):
+                                sess_providers.append(obj.rec.session.get_providers())
+                        except Exception:
+                            pass
+                    if sess_providers:
+                        print(f"[ocr] RapidOCR sessions providers sample: {sess_providers[0]}")
+                        if use_gpu and all("CUDAExecutionProvider" not in p and "TensorrtExecutionProvider" not in p for p in sess_providers):
+                            print("[ocr] WARNING: RapidOCR sessions are on CPU despite use_gpu=True. Check onnxruntime-gpu install and CUDA driver. See README troubleshooting.")
+                except Exception:
+                    pass
+
+            except Exception as e:
+                print(f"[ocr] init failed: {e}")
+                self.enabled = False
+        else:
+            print("[ocr] disabled or rapidocr not available")
             except Exception as e:
                 print(f"[ocr] init failed: {e}")
                 self.enabled = False
