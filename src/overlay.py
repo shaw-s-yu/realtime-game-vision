@@ -3,6 +3,8 @@
 import cv2
 import numpy as np
 from typing import List, Dict
+import os
+import platform
 
 try:
     import supervision as sv
@@ -10,6 +12,117 @@ try:
     SV_AVAILABLE = True
 except Exception:
     SV_AVAILABLE = False
+
+# PIL for Unicode text rendering (Chinese, Japanese, Korean etc.)
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+
+def _find_cjk_font():
+    """Find a CJK capable TTF/OTF/TTC font on Windows, macOS, Linux in order."""
+    candidates = []
+    if platform.system() == "Windows":
+        win_dir = os.environ.get("WINDIR", r"C:\Windows")
+        candidates += [
+            os.path.join(
+                win_dir, "Fonts", "msyh.ttc"
+            ),  # Microsoft YaHei UI - best for Simplified Chinese
+            os.path.join(win_dir, "Fonts", "msyhbd.ttc"),
+            os.path.join(win_dir, "Fonts", "msyhl.ttc"),
+            os.path.join(win_dir, "Fonts", "simsun.ttc"),  # SimSun
+            os.path.join(win_dir, "Fonts", "simhei.ttf"),  # SimHei
+            os.path.join(win_dir, "Fonts", "simkai.ttf"),
+            os.path.join(win_dir, "Fonts", "malgun.ttf"),  # Korean fallback
+            os.path.join(win_dir, "Fonts", "YuGothM.ttc"),  # Japanese
+            os.path.join(win_dir, "Fonts", "msgothic.ttc"),
+            os.path.join(win_dir, "Fonts", "seguisym.ttf"),  # Segoe UI Symbol partial
+            os.path.join(win_dir, "Fonts", "seguiemj.ttf"),
+        ]
+    elif platform.system() == "Darwin":
+        candidates += [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ]
+    else:  # Linux
+        candidates += [
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
+        ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+_CJK_FONT_PATH = _find_cjk_font()
+_CJK_FONT_CACHE = {}
+
+
+def _get_font(size=18):
+    if not PIL_AVAILABLE:
+        return None
+    key = size
+    if key in _CJK_FONT_CACHE:
+        return _CJK_FONT_CACHE[key]
+    try:
+        if _CJK_FONT_PATH:
+            font = ImageFont.truetype(_CJK_FONT_PATH, size)
+        else:
+            font = ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+    _CJK_FONT_CACHE[key] = font
+    return font
+
+
+def _draw_text_pil(img_bgr, text, org, color=(255, 255, 255), font_size=18):
+    """Draw Unicode text on BGR OpenCV image using PIL. Returns BGR image."""
+    if not PIL_AVAILABLE or not text:
+        # fallback to cv2 (will show ??? for CJK but better than crash)
+        cv2.putText(
+            img_bgr,
+            text.encode("ascii", "replace").decode(),
+            org,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_size / 30.0,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        return img_bgr
+    try:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(img_rgb)
+        draw = ImageDraw.Draw(pil)
+        font = _get_font(font_size)
+        # PIL uses RGB, convert BGR color to RGB
+        rgb_color = (color[2], color[1], color[0])
+        draw.text(org, str(text), fill=rgb_color, font=font)
+        return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    except Exception:
+        # fallback
+        try:
+            cv2.putText(
+                img_bgr,
+                text.encode("ascii", "replace").decode(),
+                org,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        except:
+            pass
+        return img_bgr
 
 
 class Overlay:
@@ -85,24 +198,17 @@ class Overlay:
                         cv2.LINE_AA,
                     )
 
-        # OCR boxes
+        # OCR boxes - use PIL for Unicode text rendering to support Chinese
         if self.show_ocr and ocr_result and ocr_result.get("texts"):
             for t in ocr_result["texts"]:
                 x1, y1, x2, y2 = t["x1"], t["y1"], t["x2"], t["y2"]
                 cv2.rectangle(img, (x1, y1), (x2, y2), (255, 180, 0), 1)
                 txt = t["text"][:30]
-                cv2.putText(
-                    img,
-                    txt,
-                    (x1, y2 + 15),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 180, 0),
-                    1,
-                    cv2.LINE_AA,
+                img = _draw_text_pil(
+                    img, txt, (x1, y2 + 2), color=(255, 180, 0), font_size=16
                 )
 
-        # HUD
+        # HUD - use PIL for parts that may contain Unicode (notices, VLM), cv2 for ASCII FPS
         y = 25
         if self.show_fps and fps:
             cv2.putText(
@@ -117,29 +223,25 @@ class Overlay:
             y += 28
         if ocr_result and ocr_result.get("new_notices"):
             notice = ", ".join(ocr_result["new_notices"][:3])
-            cv2.putText(
+            img = _draw_text_pil(
                 img,
                 f"NEW TEXT: {notice}",
-                (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 200, 255),
-                2,
+                (10, y - 5),
+                color=(0, 200, 255),
+                font_size=20,
             )
-            y += 24
+            y += 28
         if vlm_text:
             # wrap
             for line in vlm_text.split("\n")[:2]:
-                cv2.putText(
+                img = _draw_text_pil(
                     img,
                     f"VLM: {line[:80]}",
-                    (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (200, 200, 255),
-                    1,
+                    (10, y - 4),
+                    color=(200, 200, 255),
+                    font_size=18,
                 )
-                y += 22
+                y += 24
         cv2.putText(
             img,
             f"Detections: {len(detections)}",

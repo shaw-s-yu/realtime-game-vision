@@ -36,11 +36,25 @@ class OCRProcessor:
         )
         self.diff_threshold = diff_threshold
         self.prev_texts = set()
+        self.lang = lang
         if self.enabled:
             try:
                 # RapidOCR auto-selects GPU via onnxruntime if available
-                self.ocr = RapidOCR()
-                print("[ocr] RapidOCR initialized")
+                # Try new API with lang parameter, fallback to old API
+                try:
+                    self.ocr = RapidOCR(lang=lang)
+                except TypeError:
+                    # older rapidocr_onnxruntime uses different param names or defaults to Chinese
+                    try:
+                        # Try explicit model config for Chinese + English
+                        from rapidocr_onnxruntime import RapidOCR as RO
+
+                        # RapidOCR default models support Chinese. For English-only user would set lang=en in config.
+                        # We attempt lang first, then fallback to default.
+                        self.ocr = RO()
+                    except Exception:
+                        self.ocr = RapidOCR()
+                print(f"[ocr] RapidOCR initialized lang={lang}")
             except Exception as e:
                 print(f"[ocr] init failed: {e}")
                 self.enabled = False

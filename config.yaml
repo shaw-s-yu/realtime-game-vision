@@ -22,11 +22,11 @@ tracker:
 
 ocr:
   enabled: true
-  lang: "en"
+  lang: "ch"   # ch for Chinese+English mixed, en for English only, ch_server for higher accuracy slower, japan for Japanese, korean for Korean
   det_thresh: 0.3
   rec_thresh: 0.5
   use_gpu: true
-  roi_only: true      # only OCR on regions predicted as text-like to save time
+  roi_only: true      # only OCR on regions predicted as text-like to save time; set false to OCR full frame for Chinese UI
   text_classes: ["notice","text","dialog","button","menu"]
   diff_threshold: 0.6 # text change detection sensitivity
 
