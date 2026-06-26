@@ -2,13 +2,15 @@
 # torch CUDA 12.1 wheel for Windows NVIDIA. Adjust in setup script if needed.
 --extra-index-url https://download.pytorch.org/whl/cu121
 
-torch>=2.2.0
+torch>=2.2.0,<2.6
 torchvision>=0.17.0
 torchaudio>=2.2.0
 
-# vision stack
+# vision stack - pinned to numpy1 compatible versions to avoid pip resolver conflict
+# opencv 4.13+ requires numpy>=2 which conflicts with torch 2.2 CUDA wheel ABI.
+# Use opencv 4.10 for numpy1 stack, or switch whole stack to numpy2 + torch>=2.5 + opencv>=4.13 (see README troubleshooting)
 ultralytics>=8.3.0
-opencv-python>=4.9.0
+opencv-python>=4.9.0,<4.12
 supervision>=0.22.0
 
 # screen capture Windows DXGI
@@ -32,8 +34,8 @@ einops>=0.7.0
 ollama>=0.3.0
 requests>=2.31.0
 
-# utils
-numpy>=1.26.0
+# utils - numpy 1.x for torch 2.2 stability; for numpy2 stack use numpy>=2,<3 and torch>=2.5 and opencv>=4.13
+numpy>=1.26.0,<2
 pyyaml>=6.0
 pillow>=10.2.0
 tqdm>=4.66.0
