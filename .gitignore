@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# models weights downloaded at runtime
+*.pt
+*.onnx
+*.engine
+weights/
+models/
+
+# captures and logs
+captures/
+logs/
+output/
+*.log
+*.mp4
+*.avi
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# config local override
+config.local.yaml

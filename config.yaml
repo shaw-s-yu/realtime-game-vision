@@ -1,0 +1,59 @@
+capture:
+  target_fps: 30
+  process_fps: 10
+  region: null        # [left, top, width, height] or null for full primary
+  monitor: 0          # dxcam monitor index
+  output_width: 1280
+  output_height: null # null keeps aspect
+
+detector:
+  model: "yolov8s-worldv2.pt"   # ultralytics auto-download. Alternatives: yolov8s-world.pt, yolo11n.pt, yolo11s.pt, path/to/best.pt
+  classes: ["character","person","enemy","player","health bar","notice","button","item","text","dialog","menu"]
+  conf: 0.25
+  iou: 0.45
+  device: "cuda"      # cuda or cpu or 0
+  half: true
+  max_det: 100
+
+tracker:
+  type: "bytetrack"   # ultralytics supports bytetrack.yaml bot sort.yaml
+  track_buffer: 30
+  persist: true
+
+ocr:
+  enabled: true
+  lang: "en"
+  det_thresh: 0.3
+  rec_thresh: 0.5
+  use_gpu: true
+  roi_only: true      # only OCR on regions predicted as text-like to save time
+  text_classes: ["notice","text","dialog","button","menu"]
+  diff_threshold: 0.6 # text change detection sensitivity
+
+vlm:
+  enabled: false
+  provider: "ollama"  # ollama or transformers
+  model: "moondream:latest"  # ollama: moondream:latest or qwen2.5vl:3b ; transformers: microsoft/Florence-2-base
+  interval: 3
+  prompt: "Describe the game UI state in one short sentence. List visible characters, enemies, and any notice text."
+  timeout_ms: 2000
+  base_url: "http://localhost:11434"
+
+overlay:
+  show: true
+  show_fps: true
+  show_trails: true
+  trail_length: 15
+  show_labels: true
+  show_ocr: true
+
+output:
+  save_dir: "captures"
+  save_json: true
+  save_image: true
+  log_level: "INFO"
+
+performance:
+  queue_size: 1
+  drop_frames: true
+  warmup_frames: 5
