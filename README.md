@@ -50,28 +50,20 @@ ollama pull moondream
 ```
 Leave `use_vlm: false` in config.yaml to skip, or set true.
 
-**4. Run with live UI panel (recommended for tuning)**
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m src.main --config config.yaml --ui
-```
-This launches two windows:
-* OpenCV overlay showing detections + OCR + FPS — press `q` to quit, `s` to save screenshot JSON to captures\
-* Dear PyGui control panel titled "Realtime Game Vision Control" with sliders for process_fps, conf, iou, checkboxes for OCR, trails, etc. Changes apply live next frame without restart. Click Save to persist to config.yaml.
-
-Without UI panel, classic headless mode still works:
+**4. Run**
 ```powershell
 .\scripts\run.ps1
-# or python -m src.main --config config.yaml --no-ui
+# or
+.\.venv\Scripts\activate
+python -m src.main --config config.yaml
 ```
+Press `q` in overlay window to quit. Press `s` to save screenshot + JSON.
 
-First run downloads YOLO-World ~40 MB and RapidOCR models ~15 MB automatically. Install Dear PyGui once: it's in requirements.txt already, `pip install dearpygui` if missing.
+First run downloads YOLO-World ~40 MB and RapidOCR models ~15 MB automatically.
 
 ## Configuration
 
-Edit `config.yaml` directly, or use live UI panel `--ui` flag, or use C# WPF app in `ui-csharp/` folder which edits same yaml file and Python hot-reloads every 0.5s.
-
-```yaml
+Edit `config.yaml`:
 ```yaml
 capture:
   target_fps: 30
@@ -112,53 +104,6 @@ overlay:
   trail_length: 15
 ```
 
-## Live UI Control Panel
-
-Two options, pick one based on your stack preference.
-
-### Option A — Python Dear PyGui panel built-in (recommended, single process, pip only)
-
-Already in repo, no Visual Studio needed.
-
-```powershell
-# after venv activate and pip install -r requirements.txt which includes dearpygui
-python -m src.main --config config.yaml --ui
-```
-
-Opens second window "Realtime Game Vision Control" alongside OpenCV overlay. Sliders update these live without restart:
-
-* capture.process_fps 1-30, capture.target_fps 10-120, output_width 640-1920 (width needs restart to take effect, shows orange warning in UI)
-* detector.conf 0.05-0.9, iou, max_det, device cuda/cpu
-* ocr.enabled, ocr.lang ch/en/japan/korean, ocr roi only toggle, det/rec thresholds
-* overlay.show_trails, show_ocr, show_labels, trail_length
-* vlm.enabled, vlm.interval
-
-Changes write through thread-safe ConfigManager and main loop polls every 0.5s. Click "Save to config.yaml" in UI to persist for next run, or "Reload from Disk" if you edited yaml manually.
-
-Implementation: `src/ui_panel.py` uses Dear PyGui, runs in daemon thread, calls `config_manager.update(dotpath, value)` on slider callbacks. `src/main.py` polls `cm.get()` each loop and applies mutable parameters live. Parameters needing model reload are marked "(restart required)" in UI.
-
-Install if missing: `pip install dearpygui`
-
-### Option B — C# WPF Config Editor (separate process, native Windows UI)
-
-For teams preferring C# Windows desktop app style as you mentioned. Located in `ui-csharp/`.
-
-How it works: WPF app edits same `config.yaml` on disk using YamlDotNet. Python app has ConfigManager auto_reload=True polling file mtime every 0.5s, so changes apply live without socket IPC. Simple file-based IPC robust for tuning speed.
-
-Build:
-```powershell
-cd ui-csharp
-# requires .NET 8 SDK: winget install Microsoft.DotNet.SDK.8
-dotnet restore
-dotnet build -c Release
-dotnet run --project RealtimeGameVisionConfig
-# or open RealtimeGameVisionConfig.sln in Visual Studio 2022 and F5
-```
-
-UI shows sliders, checkboxes, combos matching Python panel layout. On value changed -> writes yaml immediately -> Python picks up next frame. Same restart-required notes apply for model path, output_width, ocr lang.
-
-Choose Python Dear PyGui for quickest start (single pip, single process). Choose C# WPF if you want native Windows look, Visual Studio designer drag-drop extensibility, or to integrate into larger C# console app ecosystem later. Both talk to same config.yaml, you can even run both at once — last write wins.
-
 ## Fine-tune for your game
 
 1. Run with `s` key to collect screenshots to `captures/`
@@ -172,20 +117,17 @@ yolo train model=yolo11n.pt data=game.yaml imgsz=960 epochs=100 device=0
 ## File layout
 ```
 src/
-  main.py          orchestration loop 10 fps, --ui flag launches control panel
-  config_manager.py thread-safe hot reload yaml manager shared between UI and main loop
-  ui_panel.py      Dear PyGui live tuning panel, sliders update config in real time
+  main.py          orchestration loop 10 fps
   capture.py       dxcam wrapper with fallback to mss
   detector.py      Ultralytics YOLO-World / YOLO wrapper
   tracker.py       ByteTrack wrapper via ultralytics persist
-  ocr.py           RapidOCR ONNX wrapper with diffing, Chinese support via PIL overlay
+  ocr.py           RapidOCR ONNX wrapper with diffing
   vlm_client.py    Ollama + transformers Florence-2 / Moondream client async
-  overlay.py       Supervision annotators + cv2 window + PIL Unicode text rendering
+  overlay.py       Supervision annotators + cv2 window
   utils.py         fps meter, config load
 config.yaml
 requirements.txt
-scripts/setup_windows.ps1  setup_windows.bat  run.ps1  run.bat  check_gpu.py
-ui-csharp/         optional C# WPF config editor alternative, edits same yaml, Python hot-reloads
+scripts/setup_windows.ps1
 ```
 
 ## Performance targets measured
