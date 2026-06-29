@@ -2,9 +2,12 @@
 # torch CUDA 12.1 wheel for Windows NVIDIA. Adjust in setup script if needed.
 --extra-index-url https://download.pytorch.org/whl/cu121
 
-torch>=2.2.0,<2.6
+torch>=2.2.0,<2.7
 torchvision>=0.17.0
 torchaudio>=2.2.0
+# torch 2.5 and 2.6 on Windows require exact sympy 1.13.1 to avoid pip resolver conflicts and runtime symbolic shape errors.
+# Do not upgrade sympy to 1.14 unless you also upgrade torch to >=2.7 which supports newer sympy.
+sympy==1.13.1
 
 # vision stack - pinned to numpy1 compatible versions to avoid pip resolver conflict
 # opencv 4.13+ requires numpy>=2 which conflicts with torch 2.2 CUDA wheel ABI.
