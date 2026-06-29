@@ -14,13 +14,20 @@ OpenCUA repo you cloned is useful as reference for action schema and evaluation,
 
 ## Architecture
 ```
-dxcam capture (BGRA, 30 fps grab, process latest)
-  -> resize 1280x720
-  -> YOLO-World / YOLO11n detect  -> ByteTrack IDs -> velocity
-  -> RapidOCR PP-OCRv4  -> text boxes, diff vs prev for notices
-  -> optional Moondream2 / Florence-2 / Qwen2.5-VL-3B via Ollama every N frames
-  -> fuse -> cv2 overlay / JSON callback
+PySide6 UI (Custom All Screen tabs)
+  -> on Start: RegionSelector dialog prompts Full Screen or Crop Region drag selection
+  -> UI writes config.runtime.yaml with selected region
+  -> VisionEngine thread started in-process (no separate process)
+     dxcam capture with region crop (BGRA, 30 fps grab, process latest at process_fps)
+       -> resize
+       -> YOLO-World / YOLO11n detect -> ByteTrack IDs -> velocity
+       -> RapidOCR PP-OCRv4 -> text boxes diff
+       -> optional VLM via Ollama
+       -> overlay draw -> emit frame via Qt signal to UI
+  -> UI Screen tab top QLabel displays live BGR frames scaled, bottom QPlainTextEdit shows log
+  -> Stop button stops engine thread, clears video widget
 ```
+UI holds config state in memory, no hot reload per spec. Start launches fresh engine thread with snapshot config including cropped region. All configuration editing happens in Custom/All tabs before Start, with Manage Fields dialog controlling Custom pane layout persisted to ui_custom.json separate from values in config.yaml.
 
 ## Quick start on Windows
 
@@ -135,19 +142,20 @@ yolo train model=yolo11n.pt data=game.yaml imgsz=960 epochs=100 device=0
 ```
 src/
   main.py            headless orchestration loop, reads config once at start, still works standalone for servers without UI
-  ui_app.py          PySide6 cross-platform UI with Custom / All / Screen tabs, Manage dialog, Start Stop buttons, embeds vision engine in-process per new spec
+  ui_app.py          PySide6 cross-platform UI with Custom / All / Screen tabs, Manage dialog, Start Stop buttons, embeds vision engine in-process per new spec, prompts region selection on Start
   vision_engine.py   VisionEngine class encapsulating capture+detect+track+ocr pipeline runnable in background thread, emits frames via callback for UI embedding, no cv2 window needed
   config_schema.py   central field definitions for UI generation, type ranges defaults restart flags
-  capture.py         dxcam wrapper with fallback to mss
+  region_selector.py PySide6 fullscreen transparent overlay for cropping screen region on Start click, returns x,y,w,h geometry for dxcam region crop
+  capture.py         dxcam wrapper with fallback to mss, supports region crop parameter
   detector.py        Ultralytics YOLO-World / YOLO wrapper
   tracker.py         ByteTrack wrapper
   ocr.py             RapidOCR ONNX wrapper with diffing, Chinese support
   vlm_client.py      Ollama client async
-  overlay.py         draws annotations onto numpy BGR frame, returns image without cv2.imshow when embedded
+  overlay.py         draws annotations onto numpy BGR frame, returns image without cv2.imshow when embedded, PIL Unicode text rendering for overlay text
   utils.py           fps meter, config load
 config.yaml          default persisted config loaded by UI on startup
 ui_custom.json       UI custom pane field selection persisted separately
-config.runtime.yaml  temporary generated on Start button press from UI in-memory state
+config.runtime.yaml  temporary generated on Start button press from UI in-memory state including selected region
 requirements.txt     includes PySide6 for UI
 scripts/
   launch_ui.ps1 launch_ui.bat launch_ui.sh   # launch UI cross-platform
@@ -173,7 +181,8 @@ Custom vs All vs Screen tabs implementation per spec:
 * All tab shows full scrollable form grouped by schema sections, no Manage button needed there, shows everything for discovery.
 * Screen tab has two vertical sections as requested: top section is video QLabel displaying live BGR frames with detections drawn by overlay.py converted to QImage, scaled keeping aspect ratio, updating at process FPS via Qt signal from vision thread. Bottom section is QPlainTextEdit read-only process log showing GPU status, FPS, new text notices, errors. No log pane in Custom or All tabs — only in Screen tab per spec.
 * Manage dialog is QDialog with QTreeWidget grouped checklist. OK saves selection to ui_custom.json and rebuilds Custom tab instantly and switches to Custom tab automatically to show result — no restart needed for UI layout change.
-* Start button in top toolbar switches to Screen tab automatically per spec requirement "when clicking start, the tab should be switched to screen", then starts VisionEngine thread. Stop button stops thread and clears video widget back to placeholder text.
+* Start button in top toolbar triggers region selection dialog first per new feature spec: QMessageBox asks Full Screen vs Select Region vs Cancel. If Select Region chosen, fullscreen transparent overlay appears allowing drag to crop rectangle, ESC cancels to full screen. Selected geometry is written into config.runtime.yaml as capture.region [x,y,w,h] for that run only, UI form fields update to reflect selection but not persisted unless user clicks Save config.yaml. Then UI switches to Screen tab automatically per spec requirement "when clicking start, the tab should be switched to screen", then starts VisionEngine thread in-process (no separate python process spawned). Stop button stops thread and clears video widget back to placeholder text.
+* Region selector implementation uses PySide6 frameless fullscreen QDialog with WA_TranslucentBackground, QRubberBand style custom paint for cross-platform Windows Linux mac support, returning virtual screen coordinates compatible with dxcam region parameter on Windows and mss region on other platforms.
 
 ## UI Usage Walkthrough
 
@@ -187,7 +196,7 @@ Custom vs All vs Screen tabs implementation per spec:
 3. In Custom tab click **Manage Fields...** button top left next to **Save Custom Layout** button. Checklist dialog opens grouped by Capture / Detector / Tracker / OCR / VLM / Overlay / Output. Check fields you want quick access to, uncheck to hide. Click OK — dialog closes, Custom tab rebuilds instantly to show new layout, status bar shows saved path and field count, green label updates. Click **Save Custom Layout** explicitly any time for confirmation dialog with full absolute path to ui_custom.json — this persists layout preference across UI sessions separate from config values.
 4. Edit values in Custom or All tab: sliders for ints/floats, checkboxes for bools, combos for enums like device cuda/cpu or ocr lang ch/en, text fields for model paths and comma-separated class lists.
 5. Click **Save config.yaml** in top toolbar to persist current field values as default for next UI session (optional — Start works without saving, using in-memory UI state snapshot).
-6. Click green **Start** button in top toolbar. UI automatically switches to **Screen** tab per spec. UI writes temporary `config.runtime.yaml` from current in-memory UI state, then starts VisionEngine in background thread within same Python process — **no separate python process spawned, no separate cv2 window**. Screen tab top section shows live video with detections embedded directly in UI via QLabel, bottom section shows process log in real time. Status label shows "running in-process".
+6. Click green **Start** button in top toolbar. A dialog pops up asking to choose capture area per new feature spec: Yes = Full Screen, No = Select Region to Crop, Cancel = abort Start. If you choose Select Region, a fullscreen semi-transparent overlay appears across all monitors — drag mouse to draw rectangle around game window or region of interest, release to confirm, or press ESC to cancel back to full screen. UI then automatically switches to **Screen** tab per spec. UI writes temporary `config.runtime.yaml` from current in-memory UI state including selected region as `capture.region: [x,y,w,h]`, then starts VisionEngine in background thread within same Python process — **no separate python process spawned, no separate cv2 window**. Screen tab top section shows live video with detections embedded directly in UI via QLabel cropping to selected region only, bottom section shows process log in real time. Status label shows "running in-process vision engine (region [x,y,w,h])" or "(full screen)".
 7. Tune sliders while running? No hot reload per spec — changes apply on next Start. Switch back to Custom or All tab while vision is running to prepare next config values if you want, but they won't affect running engine until you Stop and Start again. This avoids complexity of live parameter injection into running PyTorch model and matches spec point 2.
 8. While vision runs on Screen tab, top video pane updates at process FPS showing bounding boxes trails OCR text overlay rendered via PIL for Unicode support. Bottom log pane shows GPU status, FPS, new text notices, errors. No log pane in Custom or All tabs — only in Screen tab per spec point 4.
 9. Click red **Stop** button in top toolbar to end vision thread cleanly. Video widget returns to placeholder text "Vision stopped...". Start button re-enabled. Now edit config in Custom/All tabs again if needed, then Start again for new run with updated config snapshot.
