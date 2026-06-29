@@ -576,12 +576,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             import sys
+            import os
 
             python_exe = sys.executable
             # run as module src.main with --config pointing to runtime yaml
-            cmd = [python_exe, "-m", "src.main", "--config", str(runtime_path)]
+            # -u flag for unbuffered output so log pane updates in real time
+            cmd = [python_exe, "-u", "-m", "src.main", "--config", str(runtime_path)]
             # Use cwd as repo root so src module resolves
             cwd = str(Path(__file__).parent.parent)
+            # Log command to UI for transparency matching user expectation of seeing run.sh execution
+            self.log_edit.appendPlainText(f"[UI] Launching: {' '.join(cmd)}")
+            self.log_edit.appendPlainText(f"[UI] Working dir: {cwd}")
+            self.log_edit.appendPlainText(f"[UI] Config written to: {runtime_path}")
+            # On Windows, default to CREATE_NEW_CONSOLE so user sees separate console window similar to running run.ps1 manually,
+            # plus cv2 window will appear as child of that console process and be more visible.
+            # User can toggle this behavior via environment variable RGV_HIDE_CONSOLE=1 if they prefer hidden background process.
+            creation_flags = 0
+            if os.name == "nt":
+                hide_console = os.environ.get("RGV_HIDE_CONSOLE", "0") == "1"
+                if not hide_console:
+                    creation_flags = subprocess.CREATE_NEW_CONSOLE
+                else:
+                    creation_flags = subprocess.CREATE_NO_WINDOW
             self.proc = subprocess.Popen(
                 cmd,
                 cwd=cwd,
@@ -590,11 +606,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                creationflags=creation_flags,
             )
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             self.status_label.setText(f"Status: running pid {self.proc.pid}")
+            self.log_edit.appendPlainText(
+                f"[UI] Process started PID {self.proc.pid}. If no vision window appears in 3 seconds, check log below for errors, or check that game is in borderless windowed mode not exclusive fullscreen for dxcam capture."
+            )
             # start thread to read output non-blocking
             self._start_log_reader()
         except Exception as e:
