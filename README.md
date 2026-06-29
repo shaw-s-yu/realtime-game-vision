@@ -56,15 +56,13 @@ Leave `use_vlm: false` in config.yaml to skip, or set true.
 # or on Linux/mac: bash scripts/launch_ui.sh
 # or manual: .\.venv\Scripts\Activate.ps1 ; python -m src.ui_app
 ```
-This opens cross-platform PySide6 window with top bar tabs **Custom** and **All**.
+This opens cross-platform PySide6 window with top bar tabs **Custom**, **All**, and **Screen**.
 
 * **All tab** shows every configuration field grouped by section with proper widgets sliders checkboxes combos.
-* **Custom tab** shows your preferred subset for quick tuning. Click **Manage Fields...** button to choose which dot-paths appear there — selection saved to `ui_custom.json` for next sessions.
-* Edit values in UI, then click **Start** button to launch vision process with current configuration. UI writes temporary `config.runtime.yaml` and spawns `python -m src.main --config config.runtime.yaml` as subprocess. No hot reload needed per design — Start always launches fresh process based on entered config.
-* **Stop** button terminates vision process cleanly.
-* **Save config.yaml** button persists current UI values to repo config file for next time.
-
-Press `q` in overlay vision window to quit vision process, or use Stop button in UI. Press `s` in overlay to save screenshot + JSON to captures\.
+* **Custom tab** shows your preferred subset for quick tuning. Click **Manage Fields...** button to choose which dot-paths appear there, click **Save Custom Layout** to persist selection to `ui_custom.json`. Selection saved separately from values.
+* **Screen tab** shows live video with detections in top section and process log in bottom section — no separate cv2 window and no separate python process spawned per new spec. UI itself hosts vision engine in background thread.
+* Top toolbar has green **Start** button and red **Stop** button and gray **Save config.yaml** button visible on all tabs. Click Start -> UI automatically switches to Screen tab, writes current UI values to temporary `config.runtime.yaml`, starts in-process VisionEngine thread reading that config once at startup, no hot reload. Video appears embedded in Screen tab top pane in real time, log appears in bottom pane of same tab. Click Stop to end vision thread cleanly. No separate console window needed, though you can still run headless via scripts if preferred.
+* **Save config.yaml** button in top toolbar persists current field values to config.yaml for next UI session. **Save Custom Layout** button in Custom tab persists which fields show in Custom pane to ui_custom.json. Two separate saves by design: values vs layout preference.
 
 First run downloads YOLO-World ~40 MB and RapidOCR models ~15 MB automatically. PySide6 UI works on Windows Linux macOS same code; install via `pip install PySide6` already in requirements.
 
@@ -73,7 +71,7 @@ First run downloads YOLO-World ~40 MB and RapidOCR models ~15 MB automatically. 
 .\scripts\run.ps1
 # or .\.venv\Scripts\Activate.ps1 ; python -m src.main --config config.yaml
 ```
-Use this if you prefer editing yaml directly or running on server without GUI.
+Use this if you prefer editing yaml directly or running on server without GUI. Headless mode still opens cv2 window for overlay unless overlay.show false in config.
 
 ## Configuration
 
@@ -136,40 +134,46 @@ yolo train model=yolo11n.pt data=game.yaml imgsz=960 epochs=100 device=0
 ## File layout
 ```
 src/
-  main.py            orchestration loop, reads config once at start, no hot reload per spec
-  ui_app.py          PySide6 cross-platform UI with Custom/All tabs, Manage dialog, Start Stop buttons
-  config_schema.py   central field definitions for UI generation, type, ranges, defaults, restart flags
-  config_manager.py  (legacy, not used in new UI flow - UI holds state in memory, writes temp yaml on Start)
+  main.py            headless orchestration loop, reads config once at start, still works standalone for servers without UI
+  ui_app.py          PySide6 cross-platform UI with Custom / All / Screen tabs, Manage dialog, Start Stop buttons, embeds vision engine in-process per new spec
+  vision_engine.py   VisionEngine class encapsulating capture+detect+track+ocr pipeline runnable in background thread, emits frames via callback for UI embedding, no cv2 window needed
+  config_schema.py   central field definitions for UI generation, type ranges defaults restart flags
   capture.py         dxcam wrapper with fallback to mss
   detector.py        Ultralytics YOLO-World / YOLO wrapper
-  tracker.py         ByteTrack wrapper via ultralytics persist
-  ocr.py             RapidOCR ONNX wrapper with diffing, Chinese support via PIL overlay
+  tracker.py         ByteTrack wrapper
+  ocr.py             RapidOCR ONNX wrapper with diffing, Chinese support
   vlm_client.py      Ollama client async
-  overlay.py         Supervision annotators + cv2 window + PIL Unicode text rendering
+  overlay.py         draws annotations onto numpy BGR frame, returns image without cv2.imshow when embedded
   utils.py           fps meter, config load
-config.yaml          default persisted config, loaded by UI on startup
-ui_custom.json       UI custom pane field selection persisted separately (created on first Manage save)
-config.runtime.yaml  temporary generated on Start button press, deleted on next Start
-requirements.txt
+config.yaml          default persisted config loaded by UI on startup
+ui_custom.json       UI custom pane field selection persisted separately
+config.runtime.yaml  temporary generated on Start button press from UI in-memory state
+requirements.txt     includes PySide6 for UI
 scripts/
-  setup_windows.ps1  setup_windows.bat
-  launch_ui.ps1  launch_ui.bat  launch_ui.sh   # UI launcher cross-platform
-  run.ps1 run.bat   # headless direct launch without UI
+  launch_ui.ps1 launch_ui.bat launch_ui.sh   # launch UI cross-platform
+  setup_windows.ps1 setup_windows.bat
+  run.ps1 run.bat   # headless direct launch without UI still available
   check_gpu.py
 ```
 
 ## UI Design Rationale
 
-We chose **Option D hybrid** approach after evaluating alternatives:
+We chose **Option D hybrid** approach after evaluating alternatives per your selection:
 
-* **A yaml file only**: UI edits file directly, simple but no in-memory state separation and risk of partial writes.
-* **B in-memory via stdin JSON no file**: clean but loses human readability and harder to debug running config.
-* **C SQLite profile store**: good for multi-profile versioning but overkill for single-user desktop tool, adds dependency.
-* **D hybrid chosen**: UI holds state in memory dict loaded from default config.yaml on startup. User edits in UI tabs. On Start button, UI writes current state to temporary `config.runtime.yaml` then launches `python -m src.main --config config.runtime.yaml` as subprocess. Stop button terminates subprocess via PID. Optional Save button writes back to `config.yaml` for persistence across sessions. No hot reload needed per spec — each Start launches fresh process with snapshot of UI state at that moment. Simple file-based IPC works cross-platform and cross-language, matches existing main.py --config interface without modification to vision core.
+* **A yaml file only**: UI edits file directly simple but no in-memory separation.
+* **B in-memory via stdin JSON no file**: clean but loses human readability.
+* **C SQLite profile store**: good for multi-profile but overkill.
+* **D hybrid chosen**: UI holds state in memory dict loaded from default config.yaml on startup. User edits in UI tabs Custom / All. Manage button edits which fields appear in Custom pane saved to ui_custom.json separate from values. On Start button UI writes current in-memory state to temporary config.runtime.yaml then starts VisionEngine in-process background thread reading that config once at startup — no separate python process spawned per new spec, no hot reload. Stop button stops engine thread. Optional Save config.yaml button persists values for next UI session. Simple file-based snapshot works cross-platform and keeps vision core unchanged except now embedded not subprocess.
 
-UI library choice **PySide6** because: native look on Windows Linux macOS, mature QTabWidget QTreeWidget QFormLayout QDoubleSpinBox perfect for Custom/All tabs and Manage dialog checklist, LGPL license pip installable, good subprocess QProcess or Python subprocess integration for Start Stop buttons, wide community. Alternatives considered: Dear PyGui lighter GPU accelerated but less native widget richness for complex forms; Tkinter built-in but dated look and poor DPI scaling; Textual TUI not GUI; web Flask requires browser separate process.
+UI library choice **PySide6** because cross-platform Windows Linux macOS native look, mature QTabWidget for top bar tabs, QTreeWidget for Manage dialog checklist, QFormLayout for typed fields, QThread / python threading integration easy for Start Stop, QLabel with QPixmap perfect for embedding live video frames inside Screen tab. Alternatives considered: Dear PyGui lighter but less native widget richness; Tkinter built-in but dated and poor DPI; Textual TUI not GUI; web Flask requires browser separate.
 
-Custom vs All tabs implementation: All tab builds form dynamically from central SCHEMA list in `config_schema.py` grouped by top-level sections. Custom tab builds same form widget factory but filtered to dot-paths listed in `ui_custom.json`. Manage button opens QDialog with QTreeWidget grouped checklist, saves selection back to json, rebuilds Custom tab layout on next UI open (or dynamic rebuild). This satisfies spec requirement for user-preferred pane.
+Custom vs All vs Screen tabs implementation per spec:
+* Top bar QTabWidget has three tabs in order: **Custom**, **All**, **Screen**.
+* Custom tab top row has Manage Fields... button and Save Custom Layout button and green status label showing field count and ui_custom.json path. Below is scrollable form showing only selected fields.
+* All tab shows full scrollable form grouped by schema sections, no Manage button needed there, shows everything for discovery.
+* Screen tab has two vertical sections as requested: top section is video QLabel displaying live BGR frames with detections drawn by overlay.py converted to QImage, scaled keeping aspect ratio, updating at process FPS via Qt signal from vision thread. Bottom section is QPlainTextEdit read-only process log showing GPU status, FPS, new text notices, errors. No log pane in Custom or All tabs — only in Screen tab per spec.
+* Manage dialog is QDialog with QTreeWidget grouped checklist. OK saves selection to ui_custom.json and rebuilds Custom tab instantly and switches to Custom tab automatically to show result — no restart needed for UI layout change.
+* Start button in top toolbar switches to Screen tab automatically per spec requirement "when clicking start, the tab should be switched to screen", then starts VisionEngine thread. Stop button stops thread and clears video widget back to placeholder text.
 
 ## UI Usage Walkthrough
 
@@ -179,17 +183,18 @@ Custom vs All tabs implementation: All tab builds form dynamically from central 
 # Linux/mac: bash scripts/launch_ui.sh
 # or python -m src.ui_app
 ```
-2. Top bar shows two tabs: **Custom** and **All**. Start on Custom for quick tuning, switch to All to see every field grouped by section.
-3. In Custom tab click **Manage Fields...** button top left. Checklist dialog opens grouped by Capture / Detector / Tracker / OCR / VLM / Overlay / Output. Check fields you want quick access to, uncheck to hide. OK saves to `ui_custom.json`. Reopen Custom tab to see updated layout (or restart UI for full rebuild in current version).
-4. Edit values: sliders for ints/floats, checkboxes for bools, combos for enums like device cuda/cpu or ocr lang ch/en, text fields for model paths and comma-separated class lists.
-5. Click **Save config.yaml** bottom to persist current values as default for next session (optional).
-6. Click green **Start** button top bar. UI writes temp `config.runtime.yaml` then spawns vision process. Status label changes to "running pid XXXX". Overlay window appears showing live detections.
-7. Tune sliders while running? No hot reload per spec — changes apply on next Start. Stop current run with red **Stop** button, adjust values in UI, Start again. This avoids complexity of live parameter injection into running PyTorch model.
-8. While vision runs, UI log pane at bottom shows stdout from subprocess including GPU status, FPS, new text notices.
-9. In overlay window press `s` to save screenshot + JSON to captures folder for later fine-tune dataset, press `q` to quit vision process (or use Stop button in UI).
-10. Close UI window -> prompts to stop running vision process if still active.
+2. Top bar shows three tabs: **Custom**, **All**, **Screen**. Start on Custom or All for configuration editing. Custom shows your preferred subset, All shows full schema grouped.
+3. In Custom tab click **Manage Fields...** button top left next to **Save Custom Layout** button. Checklist dialog opens grouped by Capture / Detector / Tracker / OCR / VLM / Overlay / Output. Check fields you want quick access to, uncheck to hide. Click OK — dialog closes, Custom tab rebuilds instantly to show new layout, status bar shows saved path and field count, green label updates. Click **Save Custom Layout** explicitly any time for confirmation dialog with full absolute path to ui_custom.json — this persists layout preference across UI sessions separate from config values.
+4. Edit values in Custom or All tab: sliders for ints/floats, checkboxes for bools, combos for enums like device cuda/cpu or ocr lang ch/en, text fields for model paths and comma-separated class lists.
+5. Click **Save config.yaml** in top toolbar to persist current field values as default for next UI session (optional — Start works without saving, using in-memory UI state snapshot).
+6. Click green **Start** button in top toolbar. UI automatically switches to **Screen** tab per spec. UI writes temporary `config.runtime.yaml` from current in-memory UI state, then starts VisionEngine in background thread within same Python process — **no separate python process spawned, no separate cv2 window**. Screen tab top section shows live video with detections embedded directly in UI via QLabel, bottom section shows process log in real time. Status label shows "running in-process".
+7. Tune sliders while running? No hot reload per spec — changes apply on next Start. Switch back to Custom or All tab while vision is running to prepare next config values if you want, but they won't affect running engine until you Stop and Start again. This avoids complexity of live parameter injection into running PyTorch model and matches spec point 2.
+8. While vision runs on Screen tab, top video pane updates at process FPS showing bounding boxes trails OCR text overlay rendered via PIL for Unicode support. Bottom log pane shows GPU status, FPS, new text notices, errors. No log pane in Custom or All tabs — only in Screen tab per spec point 4.
+9. Click red **Stop** button in top toolbar to end vision thread cleanly. Video widget returns to placeholder text "Vision stopped...". Start button re-enabled. Now edit config in Custom/All tabs again if needed, then Start again for new run with updated config snapshot.
+10. Close UI window -> prompts to stop running vision engine if still active, then quits cleanly.
+11. For headless mode without UI still available via `python -m src.main --config config.yaml` which opens separate cv2 window as before for servers or debugging.
 
-For C# WPF alternative see `ui-csharp/` folder README — same yaml file contract, Python hot-reloads file on Start only, so C# app can be used instead of Python UI if preferred, though Python PySide6 version is primary cross-platform implementation.
+For C# WPF alternative see `ui-csharp/` folder README — same yaml file contract, but note C# version would need to launch Python UI app as subprocess or embed via Python.NET to get embedded video inside WPF; file-based config contract still works for Start action launching python UI or headless process. Python PySide6 version is primary cross-platform implementation meeting spec fully with embedded video.
 
 ## Performance targets measured
 
