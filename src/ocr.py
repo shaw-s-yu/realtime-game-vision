@@ -65,38 +65,55 @@ class OCRProcessor:
                         last_err = e
                         continue
                 if ocr_obj is None:
-                    raise RuntimeError(f"RapidOCR init failed with all signatures, last error: {last_err}")
+                    raise RuntimeError(
+                        f"RapidOCR init failed with all signatures, last error: {last_err}"
+                    )
                 self.ocr = ocr_obj
                 print(f"[ocr] RapidOCR initialized lang={lang} use_gpu={use_gpu}")
 
                 # Log which onnx providers RapidOCR actually ended up using
                 try:
                     import onnxruntime as ort
+
                     prov = ort.get_available_providers()
                     print(f"[ocr] onnxruntime available providers: {prov}")
                     # Try to inspect internal sessions if accessible
                     sess_providers = []
-                    for attr in ["text_det", "text_rec", "text_cls", "det", "rec", "cls"]:
+                    for attr in [
+                        "text_det",
+                        "text_rec",
+                        "text_cls",
+                        "det",
+                        "rec",
+                        "cls",
+                    ]:
                         try:
                             obj = getattr(self.ocr, attr, None)
                             if obj and hasattr(obj, "session"):
                                 sess_providers.append(obj.session.get_providers())
-                            elif obj and hasattr(obj, "rec") and hasattr(obj.rec, "session"):
+                            elif (
+                                obj
+                                and hasattr(obj, "rec")
+                                and hasattr(obj.rec, "session")
+                            ):
                                 sess_providers.append(obj.rec.session.get_providers())
                         except Exception:
                             pass
                     if sess_providers:
-                        print(f"[ocr] RapidOCR sessions providers sample: {sess_providers[0]}")
-                        if use_gpu and all("CUDAExecutionProvider" not in p and "TensorrtExecutionProvider" not in p for p in sess_providers):
-                            print("[ocr] WARNING: RapidOCR sessions are on CPU despite use_gpu=True. Check onnxruntime-gpu install and CUDA driver. See README troubleshooting.")
+                        print(
+                            f"[ocr] RapidOCR sessions providers sample: {sess_providers[0]}"
+                        )
+                        if use_gpu and all(
+                            "CUDAExecutionProvider" not in p
+                            and "TensorrtExecutionProvider" not in p
+                            for p in sess_providers
+                        ):
+                            print(
+                                "[ocr] WARNING: RapidOCR sessions are on CPU despite use_gpu=True. Check onnxruntime-gpu install and CUDA driver. See README troubleshooting."
+                            )
                 except Exception:
                     pass
 
-            except Exception as e:
-                print(f"[ocr] init failed: {e}")
-                self.enabled = False
-        else:
-            print("[ocr] disabled or rapidocr not available")
             except Exception as e:
                 print(f"[ocr] init failed: {e}")
                 self.enabled = False
