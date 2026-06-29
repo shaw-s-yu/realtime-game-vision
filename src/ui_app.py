@@ -394,6 +394,15 @@ class MainWindow(QtWidgets.QMainWindow):
         manage_btn.setToolTip("Choose which configuration fields appear in Custom tab")
         manage_btn.clicked.connect(self.on_manage)
         manage_hbox.addWidget(manage_btn)
+        self.save_custom_btn = QtWidgets.QPushButton("Save Custom Layout")
+        self.save_custom_btn.setToolTip(
+            "Save current custom field selection to ui_custom.json"
+        )
+        self.save_custom_btn.clicked.connect(self.on_save_custom)
+        manage_hbox.addWidget(self.save_custom_btn)
+        self.custom_status_label = QtWidgets.QLabel("")
+        self.custom_status_label.setStyleSheet("color:#2a7d2a; font-style:italic;")
+        manage_hbox.addWidget(self.custom_status_label)
         manage_hbox.addWidget(
             QtWidgets.QLabel(
                 "Custom pane shows selected fields for quick tuning. All pane shows everything."
@@ -438,6 +447,8 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl.setWordWrap(True)
             self.custom_form_container_holder.addWidget(lbl)
             self.custom_form = None
+            if hasattr(self, "custom_status_label"):
+                self.custom_status_label.setText("Custom: 0 fields")
         else:
             # load current values from All form to keep in sync, or from base config
             current_vals = (
@@ -457,6 +468,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 temp_cfg = load_yaml(CONFIG_PATH)
             self.custom_form = ConfigFormWidget(filtered_schema, temp_cfg)
             self.custom_form_container_holder.addWidget(self.custom_form)
+            if hasattr(self, "custom_status_label"):
+                self.custom_status_label.setText(
+                    f"Custom: {len(filtered_schema)} fields | ui_custom.json"
+                )
 
     def on_manage(self):
         dlg = ManageDialog(self.custom_selection, self)
@@ -472,8 +487,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             self.rebuild_custom_form()
-            self.status_label.setText(
-                "Custom fields updated — switch to Custom tab to see new layout"
+            # switch to Custom tab automatically to show result immediately
+            # find Custom tab index by label
+            for i in range(self.tabs.count()):
+                if self.tabs.tabText(i).lower() == "custom":
+                    self.tabs.setCurrentIndex(i)
+                    break
+            msg = f"Custom layout saved to {self.custom_path.name} with {len(self.custom_selection)} fields — Custom tab updated live"
+            self.status_label.setText(msg)
+            self.custom_status_label.setText(
+                f"Saved {len(self.custom_selection)} fields to ui_custom.json"
+            )
+            self.log_edit.appendPlainText(f"[UI] {msg}")
+
+    def on_save_custom(self):
+        """Explicit save custom layout button handler - redundant with Manage OK auto-save but provides explicit UI per user feedback."""
+        try:
+            # ensure current selection is saved even if Manage dialog not reopened
+            with open(self.custom_path, "w", encoding="utf-8") as f:
+                json.dump({"fields": self.custom_selection}, f, indent=2)
+            self.custom_status_label.setText(
+                f"Custom layout saved to ui_custom.json ({len(self.custom_selection)} fields)"
+            )
+            self.status_label.setText("Status: ui_custom.json saved")
+            self.log_edit.appendPlainText(
+                f"[UI] Custom layout explicitly saved to {self.custom_path} with {len(self.custom_selection)} fields"
+            )
+            QtWidgets.QMessageBox.information(
+                self,
+                "Saved",
+                f"Custom field selection saved to:\n{self.custom_path.resolve()}\n\n{len(self.custom_selection)} fields will appear in Custom tab on next UI launch.\nCurrent Custom tab already reflects selection.",
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Error", f"Failed to save ui_custom.json: {e}"
             )
 
     def collect_all_values(self):
