@@ -40,3 +40,5 @@ pyyaml>=6.0
 pillow>=10.2.0
 tqdm>=4.66.0
 psutil>=5.9.0
+# UI framework cross-platform Windows Linux macOS for config editor with Start Stop buttons
+PySide6>=6.6.0

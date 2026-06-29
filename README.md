@@ -50,20 +50,39 @@ ollama pull moondream
 ```
 Leave `use_vlm: false` in config.yaml to skip, or set true.
 
-**4. Run**
+**4. Run UI Config Launcher (recommended)**
+```powershell
+.\scripts\launch_ui.ps1
+# or on Linux/mac: bash scripts/launch_ui.sh
+# or manual: .\.venv\Scripts\Activate.ps1 ; python -m src.ui_app
+```
+This opens cross-platform PySide6 window with top bar tabs **Custom** and **All**.
+
+* **All tab** shows every configuration field grouped by section with proper widgets sliders checkboxes combos.
+* **Custom tab** shows your preferred subset for quick tuning. Click **Manage Fields...** button to choose which dot-paths appear there — selection saved to `ui_custom.json` for next sessions.
+* Edit values in UI, then click **Start** button to launch vision process with current configuration. UI writes temporary `config.runtime.yaml` and spawns `python -m src.main --config config.runtime.yaml` as subprocess. No hot reload needed per design — Start always launches fresh process based on entered config.
+* **Stop** button terminates vision process cleanly.
+* **Save config.yaml** button persists current UI values to repo config file for next time.
+
+Press `q` in overlay vision window to quit vision process, or use Stop button in UI. Press `s` in overlay to save screenshot + JSON to captures\.
+
+First run downloads YOLO-World ~40 MB and RapidOCR models ~15 MB automatically. PySide6 UI works on Windows Linux macOS same code; install via `pip install PySide6` already in requirements.
+
+**4b. Run headless without UI (advanced)**
 ```powershell
 .\scripts\run.ps1
-# or
-.\.venv\Scripts\activate
-python -m src.main --config config.yaml
+# or .\.venv\Scripts\Activate.ps1 ; python -m src.main --config config.yaml
 ```
-Press `q` in overlay window to quit. Press `s` to save screenshot + JSON.
-
-First run downloads YOLO-World ~40 MB and RapidOCR models ~15 MB automatically.
+Use this if you prefer editing yaml directly or running on server without GUI.
 
 ## Configuration
 
-Edit `config.yaml`:
+You have three ways to edit configuration, all using same `config.yaml` schema:
+
+1. **UI All tab** — shows every field grouped by capture / detector / tracker / ocr / vlm / overlay / output sections with proper widgets. Best for discovery.
+2. **UI Custom tab** — shows only your preferred subset. Click Manage Fields... to add/remove dot-paths like `detector.conf` or `ocr.lang`. Selection persisted to `ui_custom.json`. Best for daily tuning of 5-10 key knobs without scrolling.
+3. **Edit `config.yaml` directly** in editor — UI loads it on startup as default values. Example below:
+
 ```yaml
 capture:
   target_fps: 30
@@ -117,18 +136,60 @@ yolo train model=yolo11n.pt data=game.yaml imgsz=960 epochs=100 device=0
 ## File layout
 ```
 src/
-  main.py          orchestration loop 10 fps
-  capture.py       dxcam wrapper with fallback to mss
-  detector.py      Ultralytics YOLO-World / YOLO wrapper
-  tracker.py       ByteTrack wrapper via ultralytics persist
-  ocr.py           RapidOCR ONNX wrapper with diffing
-  vlm_client.py    Ollama + transformers Florence-2 / Moondream client async
-  overlay.py       Supervision annotators + cv2 window
-  utils.py         fps meter, config load
-config.yaml
+  main.py            orchestration loop, reads config once at start, no hot reload per spec
+  ui_app.py          PySide6 cross-platform UI with Custom/All tabs, Manage dialog, Start Stop buttons
+  config_schema.py   central field definitions for UI generation, type, ranges, defaults, restart flags
+  config_manager.py  (legacy, not used in new UI flow - UI holds state in memory, writes temp yaml on Start)
+  capture.py         dxcam wrapper with fallback to mss
+  detector.py        Ultralytics YOLO-World / YOLO wrapper
+  tracker.py         ByteTrack wrapper via ultralytics persist
+  ocr.py             RapidOCR ONNX wrapper with diffing, Chinese support via PIL overlay
+  vlm_client.py      Ollama client async
+  overlay.py         Supervision annotators + cv2 window + PIL Unicode text rendering
+  utils.py           fps meter, config load
+config.yaml          default persisted config, loaded by UI on startup
+ui_custom.json       UI custom pane field selection persisted separately (created on first Manage save)
+config.runtime.yaml  temporary generated on Start button press, deleted on next Start
 requirements.txt
-scripts/setup_windows.ps1
+scripts/
+  setup_windows.ps1  setup_windows.bat
+  launch_ui.ps1  launch_ui.bat  launch_ui.sh   # UI launcher cross-platform
+  run.ps1 run.bat   # headless direct launch without UI
+  check_gpu.py
 ```
+
+## UI Design Rationale
+
+We chose **Option D hybrid** approach after evaluating alternatives:
+
+* **A yaml file only**: UI edits file directly, simple but no in-memory state separation and risk of partial writes.
+* **B in-memory via stdin JSON no file**: clean but loses human readability and harder to debug running config.
+* **C SQLite profile store**: good for multi-profile versioning but overkill for single-user desktop tool, adds dependency.
+* **D hybrid chosen**: UI holds state in memory dict loaded from default config.yaml on startup. User edits in UI tabs. On Start button, UI writes current state to temporary `config.runtime.yaml` then launches `python -m src.main --config config.runtime.yaml` as subprocess. Stop button terminates subprocess via PID. Optional Save button writes back to `config.yaml` for persistence across sessions. No hot reload needed per spec — each Start launches fresh process with snapshot of UI state at that moment. Simple file-based IPC works cross-platform and cross-language, matches existing main.py --config interface without modification to vision core.
+
+UI library choice **PySide6** because: native look on Windows Linux macOS, mature QTabWidget QTreeWidget QFormLayout QDoubleSpinBox perfect for Custom/All tabs and Manage dialog checklist, LGPL license pip installable, good subprocess QProcess or Python subprocess integration for Start Stop buttons, wide community. Alternatives considered: Dear PyGui lighter GPU accelerated but less native widget richness for complex forms; Tkinter built-in but dated look and poor DPI scaling; Textual TUI not GUI; web Flask requires browser separate process.
+
+Custom vs All tabs implementation: All tab builds form dynamically from central SCHEMA list in `config_schema.py` grouped by top-level sections. Custom tab builds same form widget factory but filtered to dot-paths listed in `ui_custom.json`. Manage button opens QDialog with QTreeWidget grouped checklist, saves selection back to json, rebuilds Custom tab layout on next UI open (or dynamic rebuild). This satisfies spec requirement for user-preferred pane.
+
+## UI Usage Walkthrough
+
+1. Launch UI:
+```powershell
+.\scripts\launch_ui.ps1
+# Linux/mac: bash scripts/launch_ui.sh
+# or python -m src.ui_app
+```
+2. Top bar shows two tabs: **Custom** and **All**. Start on Custom for quick tuning, switch to All to see every field grouped by section.
+3. In Custom tab click **Manage Fields...** button top left. Checklist dialog opens grouped by Capture / Detector / Tracker / OCR / VLM / Overlay / Output. Check fields you want quick access to, uncheck to hide. OK saves to `ui_custom.json`. Reopen Custom tab to see updated layout (or restart UI for full rebuild in current version).
+4. Edit values: sliders for ints/floats, checkboxes for bools, combos for enums like device cuda/cpu or ocr lang ch/en, text fields for model paths and comma-separated class lists.
+5. Click **Save config.yaml** bottom to persist current values as default for next session (optional).
+6. Click green **Start** button top bar. UI writes temp `config.runtime.yaml` then spawns vision process. Status label changes to "running pid XXXX". Overlay window appears showing live detections.
+7. Tune sliders while running? No hot reload per spec — changes apply on next Start. Stop current run with red **Stop** button, adjust values in UI, Start again. This avoids complexity of live parameter injection into running PyTorch model.
+8. While vision runs, UI log pane at bottom shows stdout from subprocess including GPU status, FPS, new text notices.
+9. In overlay window press `s` to save screenshot + JSON to captures folder for later fine-tune dataset, press `q` to quit vision process (or use Stop button in UI).
+10. Close UI window -> prompts to stop running vision process if still active.
+
+For C# WPF alternative see `ui-csharp/` folder README — same yaml file contract, Python hot-reloads file on Start only, so C# app can be used instead of Python UI if preferred, though Python PySide6 version is primary cross-platform implementation.
 
 ## Performance targets measured
 
