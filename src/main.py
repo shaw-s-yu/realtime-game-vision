@@ -1,4 +1,4 @@
-"""Main orchestration loop for realtime game vision."""
+"""Main orchestration loop for realtime game vision with hot-reload config and optional UI panel."""
 
 import argparse
 import time
@@ -7,7 +7,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .utils import load_config, setup_logging, FPSMeter
+from .utils import setup_logging, FPSMeter
+from .config_manager import ConfigManager
 from .capture import ScreenCapture
 from .detector import DetectorTracker
 from .tracker import MovementTracker
@@ -15,15 +16,30 @@ from .ocr import OCRProcessor
 from .overlay import Overlay
 from .vlm_client import VLMWorker
 
+try:
+    from .ui_panel import ControlPanel
+
+    UI_AVAILABLE = True
+except Exception:
+    UI_AVAILABLE = False
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Realtime Game Vision - local screen agent"
     )
     parser.add_argument("--config", default="config.yaml", help="path to config yaml")
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="launch Dear PyGui control panel for live tuning",
+    )
+    parser.add_argument("--no-ui", dest="ui", action="store_false")
+    parser.set_defaults(ui=False)
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cm = ConfigManager(args.config, auto_reload=True)
+    cfg = cm.get()
     log = setup_logging(cfg.get("output", {}).get("log_level", "INFO"))
 
     # GPU status check at startup
@@ -70,6 +86,10 @@ def main():
     except Exception as e:
         log.warning("[GPU] onnxruntime check failed: %s", e)
 
+    def get_cfg():
+        return cm.get()
+
+    cfg = get_cfg()
     cap_cfg = cfg["capture"]
     det_cfg = cfg["detector"]
     trk_cfg = cfg["tracker"]
@@ -107,7 +127,7 @@ def main():
     movement = MovementTracker(trail_length=over_cfg.get("trail_length", 15))
     ocr = OCRProcessor(
         enabled=ocr_cfg.get("enabled", True),
-        lang=ocr_cfg.get("lang", "en"),
+        lang=ocr_cfg.get("lang", "ch"),
         det_thresh=ocr_cfg.get("det_thresh", 0.3),
         rec_thresh=ocr_cfg.get("rec_thresh", 0.5),
         use_gpu=ocr_cfg.get("use_gpu", True),
@@ -137,13 +157,31 @@ def main():
         show_ocr=over_cfg.get("show_ocr", True),
     )
 
+    # Optional UI panel thread
+    ui_panel = None
+    if args.ui:
+        if UI_AVAILABLE:
+            ui_panel = ControlPanel(cm)
+            ui_panel.start()
+            log.info(
+                "Control panel UI started — tune parameters live, changes apply next frame. Use --no-ui to disable."
+            )
+        else:
+            log.warning(
+                "UI requested but dearpygui not installed. pip install dearpygui"
+            )
+
     fps_meter = FPSMeter()
     save_dir = Path(out_cfg.get("save_dir", "captures"))
     save_dir.mkdir(exist_ok=True)
 
-    log.info("Starting main loop at target process_fps=%s", process_fps)
+    log.info(
+        "Starting main loop at target process_fps=%s (use --ui flag for live tuning panel, or edit config.yaml and it hot-reloads)",
+        process_fps,
+    )
     last_process = 0
     frame_idx = 0
+    last_cfg_check = 0
     try:
         while True:
             frame = capture.read_latest()
@@ -152,11 +190,43 @@ def main():
                 continue
 
             now = time.time()
+            # hot reload config every ~0.5 sec to pick up UI changes or file edits without restart
+            if now - last_cfg_check > 0.5:
+                last_cfg_check = now
+                new_cfg = cm.get()
+                # update runtime mutable parameters
+                new_process_fps = new_cfg.get("capture", {}).get("process_fps", 10)
+                if new_process_fps != process_fps:
+                    process_fps = max(1, min(60, new_process_fps))
+                    process_interval = 1.0 / process_fps
+                    log.info("process_fps updated live to %s", process_fps)
+                # update detector thresholds live
+                det_conf = new_cfg.get("detector", {}).get("conf", 0.25)
+                det_iou = new_cfg.get("detector", {}).get("iou", 0.45)
+                det_max = new_cfg.get("detector", {}).get("max_det", 100)
+                if hasattr(detector, "model"):
+                    # ultralytics allows runtime override via predict kwargs, we store for next call
+                    detector.conf = det_conf
+                    detector.iou = det_iou
+                    detector.max_det = det_max
+                # update overlay flags live
+                over = new_cfg.get("overlay", {})
+                overlay.show_trails = over.get("show_trails", True)
+                overlay.show_ocr = over.get("show_ocr", True)
+                overlay.show_labels = over.get("show_labels", True)
+                overlay.trail_length = over.get("trail_length", 15)
+                # update movement trail length
+                movement.trail_length = overlay.trail_length
+                # update ocr enable flag - full restart of ocr object needed for lang change, simplified to just toggle enabled flag live; lang change requires restart for now
+                ocr.enabled = (
+                    new_cfg.get("ocr", {}).get("enabled", True) and ocr.enabled
+                )  # keep false if init failed
+                # update vlm interval live
+                vlm.interval = new_cfg.get("vlm", {}).get("interval", 3)
+
             if now - last_process < process_interval:
-                # still show overlay at capture rate but skip heavy processing? we choose to skip to save CPU
-                # but for simplicity we just continue loop waiting for next process slot
+                # show lightweight preview without processing occasionally to keep UI responsive
                 if overlay.show:
-                    # show lightweight preview without processing occasionally to keep UI responsive
                     overlay.draw(
                         frame, [], {"texts": []}, movement, fps=fps_meter.fps()
                     )
@@ -170,7 +240,7 @@ def main():
             frame_idx += 1
             fps_meter.tick()
 
-            # Detector + tracker
+            # Detector + tracker - use live conf/iou from detector object updated above
             detections = detector.predict_track(frame)
             detections = movement.update(detections, timestamp=now)
 
@@ -219,6 +289,8 @@ def main():
         log.info("Interrupted")
     finally:
         log.info("Shutting down...")
+        if ui_panel:
+            ui_panel.stop()
         if vlm.enabled:
             vlm.stop()
             vlm.join(timeout=2)

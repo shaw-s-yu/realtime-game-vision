@@ -1,0 +1,81 @@
+<Window x:Class="RealtimeGameVisionConfig.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Realtime Game Vision Control Panel" Height="720" Width="520"
+        WindowStartupLocation="CenterScreen">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+    <StackPanel Margin="16" >
+        <TextBlock Text="Realtime Game Vision — Live Config" FontSize="18" FontWeight="Bold" Margin="0,0,0,12"/>
+        <TextBlock Text="Edits config.yaml in repo root. Python app hot-reloads every 0.5s. No restart needed for most values." TextWrapping="Wrap" Margin="0,0,0,12" Foreground="Gray"/>
+
+        <GroupBox Header="Capture" Margin="0,0,0,8">
+            <StackPanel Margin="8">
+                <TextBlock Text="Process FPS (1-30)"/>
+                <Slider x:Name="ProcessFpsSlider" Minimum="1" Maximum="30" Value="10" TickFrequency="1" IsSnapToTickEnabled="True" ValueChanged="OnValueChanged"/>
+                <TextBlock Text="Target FPS grab (10-120)"/>
+                <Slider x:Name="TargetFpsSlider" Minimum="10" Maximum="120" Value="30" TickFrequency="10" IsSnapToTickEnabled="True" ValueChanged="OnValueChanged"/>
+                <TextBlock Text="Output Width (640-1920) - requires restart"/>
+                <Slider x:Name="WidthSlider" Minimum="640" Maximum="1920" Value="1280" TickFrequency="160" IsSnapToTickEnabled="True" ValueChanged="OnValueChanged"/>
+                <TextBlock Text="* width change needs Python restart" Foreground="OrangeRed" FontSize="10"/>
+            </StackPanel>
+        </GroupBox>
+
+        <GroupBox Header="Detector" Margin="0,0,0,8">
+            <StackPanel Margin="8">
+                <TextBlock Text="Confidence threshold"/>
+                <Slider x:Name="ConfSlider" Minimum="0.05" Maximum="0.9" Value="0.25" TickFrequency="0.05" ValueChanged="OnValueChanged"/>
+                <TextBlock Text="IoU threshold"/>
+                <Slider x:Name="IouSlider" Minimum="0.1" Maximum="0.9" Value="0.45" TickFrequency="0.05" ValueChanged="OnValueChanged"/>
+                <TextBlock Text="Max detections"/>
+                <Slider x:Name="MaxDetSlider" Minimum="10" Maximum="200" Value="100" TickFrequency="10" IsSnapToTickEnabled="True" ValueChanged="OnValueChanged"/>
+                <TextBlock Text="Device"/>
+                <ComboBox x:Name="DeviceCombo" SelectionChanged="OnValueChanged">
+                    <ComboBoxItem Content="cuda" IsSelected="True"/>
+                    <ComboBoxItem Content="cpu"/>
+                </ComboBox>
+                <TextBlock Text="* model change requires restart - edit config.yaml manually for model path" Foreground="OrangeRed" FontSize="10"/>
+            </StackPanel>
+        </GroupBox>
+
+        <GroupBox Header="OCR" Margin="0,0,0,8">
+            <StackPanel Margin="8">
+                <CheckBox x:Name="OcrEnabled" Content="OCR Enabled" IsChecked="True" Checked="OnValueChanged" Unchecked="OnValueChanged"/>
+                <TextBlock Text="Language"/>
+                <ComboBox x:Name="OcrLangCombo" SelectionChanged="OnValueChanged">
+                    <ComboBoxItem Content="ch"/><ComboBoxItem Content="en"/><ComboBoxItem Content="ch_server"/><ComboBoxItem Content="en_server"/><ComboBoxItem Content="japan"/><ComboBoxItem Content="korean"/>
+                </ComboBox>
+                <TextBlock Text="* lang change requires restart" Foreground="OrangeRed" FontSize="10"/>
+                <CheckBox x:Name="OcrRoiOnly" Content="ROI only (faster)" IsChecked="True" Checked="OnValueChanged" Unchecked="OnValueChanged"/>
+                <TextBlock Text="Det threshold"/>
+                <Slider x:Name="OcrDetSlider" Minimum="0.1" Maximum="0.9" Value="0.3" TickFrequency="0.05" ValueChanged="OnValueChanged"/>
+                <TextBlock Text="Rec threshold"/>
+                <Slider x:Name="OcrRecSlider" Minimum="0.1" Maximum="0.9" Value="0.5" TickFrequency="0.05" ValueChanged="OnValueChanged"/>
+            </StackPanel>
+        </GroupBox>
+
+        <GroupBox Header="Overlay" Margin="0,0,0,8">
+            <StackPanel Margin="8">
+                <CheckBox x:Name="ShowTrails" Content="Show Trails" IsChecked="True" Checked="OnValueChanged" Unchecked="OnValueChanged"/>
+                <CheckBox x:Name="ShowOcr" Content="Show OCR Boxes" IsChecked="True" Checked="OnValueChanged" Unchecked="OnValueChanged"/>
+                <CheckBox x:Name="ShowLabels" Content="Show Labels" IsChecked="True" Checked="OnValueChanged" Unchecked="OnValueChanged"/>
+                <TextBlock Text="Trail Length"/>
+                <Slider x:Name="TrailSlider" Minimum="5" Maximum="60" Value="15" TickFrequency="5" IsSnapToTickEnabled="True" ValueChanged="OnValueChanged"/>
+            </StackPanel>
+        </GroupBox>
+
+        <GroupBox Header="VLM" Margin="0,0,0,8">
+            <StackPanel Margin="8">
+                <CheckBox x:Name="VlmEnabled" Content="VLM Enabled" Checked="OnValueChanged" Unchecked="OnValueChanged"/>
+                <TextBlock Text="Interval frames"/>
+                <Slider x:Name="VlmInterval" Minimum="1" Maximum="30" Value="3" TickFrequency="1" IsSnapToTickEnabled="True" ValueChanged="OnValueChanged"/>
+            </StackPanel>
+        </GroupBox>
+
+        <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+            <Button Content="Save Now" Width="120" Margin="0,0,8,0" Click="Save_Click"/>
+            <Button Content="Reload from Disk" Width="120" Click="Reload_Click"/>
+        </StackPanel>
+        <TextBlock x:Name="StatusText" Margin="0,8,0,0" Foreground="Green" TextWrapping="Wrap"/>
+    </StackPanel>
+    </ScrollViewer>
+</Window>
