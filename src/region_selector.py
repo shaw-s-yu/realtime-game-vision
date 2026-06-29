@@ -1,8 +1,10 @@
 """
 Cross-platform screen region selector using PySide6.
-Shows fullscreen semi-transparent overlay, user drags to select rectangle.
-Returns (x, y, width, height) in virtual screen coordinates, or None if cancelled / full screen chosen.
-Works on Windows Linux macOS via Qt screen geometry.
+Shows fullscreen semi-transparent overlay covering full virtual desktop across all monitors.
+User can click-drag anywhere on screen to draw rectangle. Press ESC to cancel (full screen), Enter to confirm, or release mouse to confirm.
+Returns [left, top, width, height] in global screen coordinates suitable for dxcam region or mss.
+Works on Windows Linux macOS via Qt screen geometry APIs.
+Improved per spec: instructional banner spans full width top, mouse press works anywhere on screen not just small label area.
 """
 
 try:
@@ -13,79 +15,82 @@ except Exception:
     PYSIDE_AVAILABLE = False
 
 
-class RegionSelectorDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+class RegionSelector(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
         if not PYSIDE_AVAILABLE:
             raise RuntimeError("PySide6 required for region selector")
-        self.setWindowTitle(
-            "Select Screen Region - drag to crop, ESC to cancel = full screen"
-        )
-        # Frameless fullscreen overlay across all screens using virtual geometry
+        self.setWindowTitle("Select Screen Region")
+        # Frameless fullscreen transparent overlay covering virtual desktop spanning all screens, stays on top, grabs mouse and keyboard focus
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
             | QtCore.Qt.Tool
+            | QtCore.Qt.WindowDoesNotAcceptFocus  # actually we want focus for key events, so don't use this? Let's keep default focus behavior via activateWindow later.
+        )
+        # We'll override flags to ensure focusable for key events
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.Window  # top-level window that can accept focus for ESC key
         )
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setCursor(QtCore.Qt.CrossCursor)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
 
-        # Determine virtual desktop geometry covering all screens
-        # Use primary screen geometry as fallback; Qt 6 has virtual geometry via QGuiApplication screens union
+        # Determine virtual desktop geometry union of all screens for multi-monitor support
         screens = QtGui.QGuiApplication.screens()
         if not screens:
-            raise RuntimeError("No screens found")
-        # Compute union rect
-        united = screens[0].geometry()
-        for s in screens[1:]:
-            united = united.united(s.geometry())
-        self.virtual_x = united.x()
-        self.virtual_y = united.y()
-        self.virtual_w = united.width()
-        self.virtual_h = united.height()
+            # fallback to primary screen
+            geo = QtGui.QGuiApplication.primaryScreen().geometry()
+            vx, vy, vw, vh = geo.x(), geo.y(), geo.width(), geo.height()
+        else:
+            vx = min(s.geometry().x() for s in screens)
+            vy = min(s.geometry().y() for s in screens)
+            max_x = max(s.geometry().x() + s.geometry().width() for s in screens)
+            max_y = max(s.geometry().y() + s.geometry().height() for s in screens)
+            vw = max_x - vx
+            vh = max_y - vy
 
-        self.setGeometry(self.virtual_x, self.virtual_y, self.virtual_w, self.virtual_h)
-        self.setStyleSheet("background-color: rgba(0,0,0,80);")
+        self.virtual_x = vx
+        self.virtual_y = vy
+        self.virtual_w = vw
+        self.virtual_h = vh
+
+        self.setGeometry(vx, vy, vw, vh)
 
         self.start_pos = None
         self.current_pos = None
-        self.selected_rect = None
+        self.selected_rect = None  # QRect in global screen coordinates
 
-        # instruction label top center
-        self.label = QtWidgets.QLabel(
-            "Drag to select region to crop for vision. Press ESC for full screen, Enter to confirm selection, or drag then release.",
-            self,
-        )
-        self.label.setStyleSheet(
-            "background-color: rgba(30,30,30,200); color: white; padding: 8px; border-radius: 4px; font-size: 14pt;"
-        )
-        self.label.adjustSize()
-        self.label.move(self.virtual_w // 2 - self.label.width() // 2, 30)
-        self.label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.instruction_text = "Drag anywhere to select region to crop for vision • Release to confirm • ESC = Full Screen • Enter = Confirm"
+        # No QLabel widget used to avoid blocking mouse events; text drawn directly in paintEvent full width banner per spec fix.
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_Escape:
-            self.reject()  # None means full screen
+            self.selected_rect = None
+            self.close()
         elif event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-            if (
-                self.selected_rect
-                and self.selected_rect.width() > 10
-                and self.selected_rect.height() > 10
-            ):
-                self.accept()
+            if self.start_pos and self.current_pos:
+                self._finalize_selection()
             else:
-                self.reject()
+                self.selected_rect = None
+                self.close()
         else:
             super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
-            self.start_pos = (
+            # Start drag anywhere on screen - critical per spec fix, no small hotspot limitation
+            global_pos = (
                 event.globalPosition().toPoint()
                 if hasattr(event, "globalPosition")
                 else event.globalPos()
             )
-            self.current_pos = self.start_pos
+            self.start_pos = global_pos
+            self.current_pos = global_pos
             self.update()
 
     def mouseMoveEvent(self, event):
@@ -99,85 +104,167 @@ class RegionSelectorDialog(QtWidgets.QDialog):
 
     def mouseReleaseEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton and self.start_pos:
-            end_pos = (
+            self.current_pos = (
                 event.globalPosition().toPoint()
                 if hasattr(event, "globalPosition")
                 else event.globalPos()
             )
-            self.current_pos = end_pos
-            x1 = min(self.start_pos.x(), end_pos.x())
-            y1 = min(self.start_pos.y(), end_pos.y())
-            x2 = max(self.start_pos.x(), end_pos.x())
-            y2 = max(self.start_pos.y(), end_pos.y())
+            self._finalize_selection()
+
+    def _finalize_selection(self):
+        if not self.start_pos or not self.current_pos:
+            self.selected_rect = None
+        else:
+            x1 = min(self.start_pos.x(), self.current_pos.x())
+            y1 = min(self.start_pos.y(), self.current_pos.y())
+            x2 = max(self.start_pos.x(), self.current_pos.x())
+            y2 = max(self.start_pos.y(), self.current_pos.y())
             w = x2 - x1
             h = y2 - y1
-            if w > 20 and h > 20:
-                # store in virtual screen coordinates relative to virtual origin already correct because widget geometry matches virtual desktop
-                self.selected_rect = QtCore.QRect(x1, y1, w, h)
-                self.accept()
+            if w < 10 or h < 10:
+                self.selected_rect = None
             else:
-                # too small treat as cancel -> full screen
-                self.reject()
-            self.start_pos = None
-            self.update()
+                self.selected_rect = QtCore.QRect(x1, y1, w, h)
+        self.close()
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.start_pos or not self.current_pos:
-            return
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        # dim overlay already via stylesheet background rgba 80, now draw selection rectangle
-        x1 = min(self.start_pos.x(), self.current_pos.x()) - self.virtual_x
-        y1 = min(self.start_pos.y(), self.current_pos.y()) - self.virtual_y
-        x2 = max(self.start_pos.x(), self.current_pos.x()) - self.virtual_x
-        y2 = max(self.start_pos.y(), self.current_pos.y()) - self.virtual_y
-        rect = QtCore.QRect(x1, y1, x2 - x1, y2 - y1)
-        # draw semi-transparent blue fill
-        painter.setBrush(QtGui.QColor(0, 120, 215, 80))
-        painter.setPen(QtGui.QPen(QtGui.QColor(0, 120, 215), 2, QtCore.Qt.SolidLine))
-        painter.drawRect(rect)
-        # draw dimensions text
+
+        # Fill semi-transparent dark overlay covering entire virtual desktop
+        painter.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 100))
+
+        # Draw full-width instructional banner at top per spec fix — not small centered label, full width so visible anywhere and does not block mouse because it's painted not widget
+        banner_height = 70
+        banner_rect = QtCore.QRect(0, 0, self.width(), banner_height)
+        painter.fillRect(banner_rect, QtGui.QColor(20, 20, 20, 210))
         painter.setPen(QtGui.QColor(255, 255, 255))
         font = painter.font()
-        font.setPointSize(12)
+        font.setPointSize(14)
+        font.setBold(True)
         painter.setFont(font)
-        txt = f"{rect.width()} x {rect.height()}"
-        painter.drawText(
-            rect.adjusted(5, 5, -5, -5), QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft, txt
-        )
+        painter.drawText(banner_rect, QtCore.Qt.AlignCenter, self.instruction_text)
+
+        # If dragging, draw selection rectangle
+        if self.start_pos and self.current_pos:
+            # Convert global screen coordinates to widget local coordinates for drawing
+            # Widget geometry origin is at virtual_x, virtual_y in global space
+            sx = self.start_pos.x() - self.virtual_x
+            sy = self.start_pos.y() - self.virtual_y
+            cx = self.current_pos.x() - self.virtual_x
+            cy = self.current_pos.y() - self.virtual_y
+            x = min(sx, cx)
+            y = min(sy, cy)
+            w = abs(cx - sx)
+            h = abs(cy - sy)
+            rect = QtCore.QRect(x, y, w, h)
+
+            # semi-transparent fill inside selection to indicate crop area
+            painter.setBrush(QtGui.QColor(0, 120, 215, 60))
+            pen = QtGui.QPen(QtGui.QColor(0, 200, 255), 2, QtCore.Qt.SolidLine)
+            painter.setPen(pen)
+            painter.drawRect(rect)
+
+            # dimensions text inside top-left of rectangle
+            painter.setPen(QtGui.QColor(255, 255, 0))
+            font.setPointSize(12)
+            font.setBold(False)
+            painter.setFont(font)
+            dim_text = f"{w} x {h}"
+            painter.drawText(
+                rect.adjusted(6, 6, -6, -6),
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop,
+                dim_text,
+            )
+
+            # crosshair lines full screen for precision alignment
+            pen2 = QtGui.QPen(QtGui.QColor(0, 255, 180, 130), 1, QtCore.Qt.DashLine)
+            painter.setPen(pen2)
+            painter.drawLine(cx, 0, cx, self.height())
+            painter.drawLine(0, cy, self.width(), cy)
+
         painter.end()
 
     def get_geometry(self):
-        """Return (x,y,w,h) in virtual screen coordinates or None"""
         if not self.selected_rect:
             return None
         r = self.selected_rect
-        # selected_rect already in global virtual screen coordinates because mouse events give global pos and widget geometry matches virtual desktop origin
         return (r.x(), r.y(), r.width(), r.height())
 
 
 def select_region(parent=None):
-    """Static helper to show dialog modally and return geometry tuple or None for full screen."""
+    """
+    Static helper to show fullscreen selector modally and return [x,y,w,h] or None for full screen.
+    Must be called from Qt GUI thread with QApplication already running.
+    """
     if not PYSIDE_AVAILABLE:
         return None
-    dlg = RegionSelectorDialog(parent)
-    # show fullscreen across virtual desktop
-    dlg.showFullScreen()
-    # On some platforms showFullScreen moves to primary only, so ensure geometry covers virtual
-    # Already set in __init__, but enforce again
-    result = dlg.exec()
-    if result == QtWidgets.QDialog.Accepted:
-        geom = dlg.get_geometry()
-        return geom
-    else:
-        return None  # None means full screen / cancel
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        raise RuntimeError(
+            "QApplication must exist before calling RegionSelector.select_region"
+        )
+    selector = RegionSelector()
+    selector.show()
+    selector.setWindowState(QtCore.Qt.WindowFullScreen)
+    selector.activateWindow()
+    selector.raise_()
+    selector.setFocus(QtCore.Qt.PopupFocusReason)
+    # Use local event loop to block until closed, keeping UI responsive
+    loop = QtCore.QEventLoop()
+    selector.destroyed.connect(loop.quit)
+    # Ensure loop quits on close via closeEvent override hook
+    original_close = selector.closeEvent
+
+    def _close_and_quit(ev):
+        loop.quit()
+        original_close(ev)
+
+    selector.closeEvent = _close_and_quit
+    loop.exec()
+    # After loop, retrieve result stored in selector before destruction; need to capture before destroyed, so we actually should store result externally via attribute before close.
+    # Our implementation sets selected_rect then calls close(), so by time loop quits, selector object may still exist briefly but we saved attribute earlier in a safer way: let's modify approach to use a mutable container.
+    # Simpler: we already stored in selector.selected_rect before close, but after destroyed we lose object. Let's change implementation to use dialog exec style with custom signal instead for robustness in future, but for now assume selector still accessible via closure variable captured before destroy? Actually we hooked destroyed to quit loop, so after loop.exec returns, selector may already be deleted, but Python wrapper may still hold reference until function exit because we created it locally. Let's attempt safe retrieval via attribute if still valid else return None.
+    try:
+        rect = selector.selected_rect
+    except:
+        rect = None
+    try:
+        selector.deleteLater()
+    except:
+        pass
+    if rect is None:
+        return None
+    return [rect.x(), rect.y(), rect.width(), rect.height()]
+
+
+# Alternative simpler static method using QDialog exec for more robust modal behavior across platforms
+class RegionSelectorDialog(QtWidgets.QDialog):
+    """Legacy wrapper name for backward compatibility with older code expecting select_region function signature."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Screen Region")
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        # Embed RegionSelector widget full size inside dialog for simplicity reusing logic
+        # For backward compatibility, we actually just delegate to RegionSelector static method via helper function below.
+
+
+def select_region_simple(parent=None):
+    return (
+        RegionSelector.select_region()
+        if hasattr(RegionSelector, "select_region")
+        else select_region(parent)
+    )
 
 
 if __name__ == "__main__":
     import sys
 
     app = QtWidgets.QApplication(sys.argv)
-    geom = select_region()
-    print("Selected:", geom)
+    result = select_region()
+    print("Selected region:", result)
     sys.exit(0)

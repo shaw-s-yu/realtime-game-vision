@@ -10,33 +10,6 @@ No hot reload per spec — Start launches fresh in-process engine with snapshot 
 
 import sys
 import os
-
-# Ensure CUDA visibility before any other imports that might interfere with DLL loading order on Windows.
-# PySide6 Qt platform plugin can load OpenGL DLLs that sometimes interfere with PyTorch CUDA context initialization if torch is imported after Qt.
-# We force torch import and CUDA init early as workaround for RTX 4070 + PySide6 issue observed in logs where torch.cuda.is_available() returns False inside UI process but True in standalone check_gpu.py.
-# See troubleshooting in README.
-os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
-# Do not set CUDA_VISIBLE_DEVICES unless user explicitly wants it; ensure it's either unset or set to valid GPU index string, not empty.
-if os.environ.get("CUDA_VISIBLE_DEVICES", "") == "":
-    # empty string means no GPU visible to CUDA - remove it to allow default behavior exposing all GPUs
-    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-
-# Early torch import to initialize CUDA before PySide6 Qt loads OpenGL platform plugin
-try:
-    import torch
-
-    _torch_cuda_available_early = torch.cuda.is_available()
-    _torch_device_count_early = (
-        torch.cuda.device_count() if _torch_cuda_available_early else 0
-    )
-    # Trigger lazy CUDA context initialization early while no Qt event loop running yet
-    if _torch_cuda_available_early:
-        _ = torch.zeros(1, device="cuda")
-        del _
-except Exception:
-    # torch not installed yet or CUDA not available at import time - will be checked again later with proper logging
-    pass
-
 import json
 import time
 from pathlib import Path
@@ -662,41 +635,58 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         # Prompt user to select screen region per new spec feature
-        # Show dialog with Full Screen vs Select Region vs Cancel
-        region_choice = QtWidgets.QMessageBox.question(
-            self,
-            "Select Capture Region",
-            "Choose capture area for vision:\n\nYes = Full Screen\nNo = Select Region to Crop\nCancel = Abort Start",
-            QtWidgets.QMessageBox.Yes
-            | QtWidgets.QMessageBox.No
-            | QtWidgets.QMessageBox.Cancel,
-            QtWidgets.QMessageBox.Yes,
+        # Use custom buttons with clear labels instead of Yes/No confusing mapping
+        msg_box = QtWidgets.QMessageBox(self)
+        msg_box.setWindowTitle("Select Screen Region")
+        msg_box.setText(
+            "Choose capture area for vision detection:\n\n"
+            "Select Region = drag rectangle on fullscreen overlay to crop\n"
+            "Full Screen = use entire screen\n"
+            "Cancel = abort Start"
         )
+        msg_box.setIcon(QtWidgets.QMessageBox.Question)
+        btn_full = msg_box.addButton("Full Screen", QtWidgets.QMessageBox.AcceptRole)
+        btn_region = msg_box.addButton(
+            "Select Region", QtWidgets.QMessageBox.ActionRole
+        )
+        btn_cancel = msg_box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        msg_box.setDefaultButton(btn_region)
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
         selected_region = None  # None means full screen per config schema
-        if region_choice == QtWidgets.QMessageBox.Cancel:
+        if clicked == btn_cancel:
             self.log_edit.appendPlainText(
-                "[UI] Start cancelled by user at region selection"
+                "[UI] Start cancelled by user at region selection dialog"
             )
             return
-        elif region_choice == QtWidgets.QMessageBox.No:
-            # launch region selector overlay
+        elif clicked == btn_region:
+            # launch region selector overlay full screen per spec fix: user can start crop anywhere, instructional banner full width
             try:
-                # hide UI window temporarily to allow clear screen view for selection overlay? Keep UI visible but overlay is topmost fullscreen so okay.
                 self.log_edit.appendPlainText(
-                    "[UI] Opening region selector overlay... drag to select area, ESC for full screen"
+                    "[UI] Opening fullscreen region selector overlay... drag anywhere to select region, ESC for full screen, Enter to confirm."
                 )
-                # Ensure UI processes events before overlay to avoid stale frame
+                # hide main UI window temporarily for clean crop experience as per spec improvement
+                was_visible = self.isVisible()
+                self.hide()
                 QtWidgets.QApplication.processEvents()
+                import time
+
+                time.sleep(0.15)
                 try:
                     from .region_selector import select_region
                 except ImportError:
                     from region_selector import select_region
-                geom = select_region(self)  # returns (x,y,w,h) or None
+                geom = select_region()  # returns (x,y,w,h) or None
+                # restore main window
+                if was_visible:
+                    self.show()
+                    self.raise_()
+                    self.activateWindow()
                 if geom:
                     x, y, w, h = geom
                     selected_region = [int(x), int(y), int(w), int(h)]
                     self.log_edit.appendPlainText(
-                        f"[UI] Region selected: {selected_region}"
+                        f"[UI] Region selected for cropping: {selected_region}"
                     )
                 else:
                     self.log_edit.appendPlainText(
@@ -704,15 +694,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     selected_region = None
             except Exception as e:
+                try:
+                    self.show()
+                except:
+                    pass
                 QtWidgets.QMessageBox.warning(
                     self,
                     "Region Selector Error",
                     f"Failed to select region, falling back to full screen:\n{e}",
                 )
+                self.log_edit.appendPlainText(
+                    f"[UI] Region selector failed, using full screen: {e}"
+                )
                 selected_region = None
-        else:  # Yes = Full Screen
-            selected_region = None
+        else:  # Full Screen button
             self.log_edit.appendPlainText("[UI] Using full screen capture as selected")
+            selected_region = None
 
         # collect current UI values and write to runtime config, then start in-process vision engine per new spec (no separate process)
         try:

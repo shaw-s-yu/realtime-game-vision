@@ -26,38 +26,6 @@ class DetectorTracker:
     ):
         if not ULTRALYTICS_AVAILABLE:
             raise RuntimeError("ultralytics not installed. pip install ultralytics")
-        # Validate CUDA availability early and fallback to CPU gracefully to avoid repeated per-frame errors in UI log
-        # This addresses issue observed in UI logs where torch.cuda.is_available() returns False inside PySide6 process
-        # even though check_gpu.py shows True in standalone terminal due to Qt DLL loading order interference.
-        # We check here once at init time and adjust device accordingly with clear warning.
-        try:
-            import torch
-
-            cuda_available = torch.cuda.is_available()
-            cuda_count = torch.cuda.device_count() if cuda_available else 0
-            # Normalize device string: "cuda" -> "0" or "cpu" fallback, "cuda:0" stays, etc.
-            requested = str(device).lower()
-            if requested in ("cuda", "0", "cuda:0", "cuda0"):
-                if not cuda_available or cuda_count == 0:
-                    print(
-                        "[detector] WARNING: CUDA requested but torch.cuda.is_available() is False or device_count 0. "
-                        "Falling back to CPU. This significantly reduces FPS. "
-                        "Common causes on Windows with PySide6 UI: Qt loaded before torch CUDA init. "
-                        "Fix attempted in UI by early torch import, but if still failing check: "
-                        "1) nvidia-smi shows driver, 2) python -c 'import torch; print(torch.cuda.is_available())' in same venv outside UI returns True, "
-                        "3) no CUDA_VISIBLE_DEVICES='' empty string in environment, 4) reinstall torch with --index-url https://download.pytorch.org/whl/cu121 --force-reinstall"
-                    )
-                    device = "cpu"
-                    half = False  # FP16 not supported on CPU
-                else:
-                    # Normalize to cuda:0 for ultralytics clarity
-                    device = 0 if requested in ("cuda", "0") else device
-            # else keep user specified cpu or other device as is
-        except Exception as e:
-            print(f"[detector] CUDA check failed during init, falling back to cpu: {e}")
-            device = "cpu"
-            half = False
-
         self.model = YOLO(model_path)
         self.classes = classes or []
         self.conf = conf
