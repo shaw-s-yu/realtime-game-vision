@@ -634,13 +634,101 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Already Running", "Vision process already running. Stop first."
             )
             return
+        # Prompt user to select screen region per new spec feature
+        # Show dialog with Full Screen vs Select Region vs Cancel
+        region_choice = QtWidgets.QMessageBox.question(
+            self,
+            "Select Capture Region",
+            "Choose capture area for vision:\n\nYes = Full Screen\nNo = Select Region to Crop\nCancel = Abort Start",
+            QtWidgets.QMessageBox.Yes
+            | QtWidgets.QMessageBox.No
+            | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Yes,
+        )
+        selected_region = None  # None means full screen per config schema
+        if region_choice == QtWidgets.QMessageBox.Cancel:
+            self.log_edit.appendPlainText(
+                "[UI] Start cancelled by user at region selection"
+            )
+            return
+        elif region_choice == QtWidgets.QMessageBox.No:
+            # launch region selector overlay
+            try:
+                # hide UI window temporarily to allow clear screen view for selection overlay? Keep UI visible but overlay is topmost fullscreen so okay.
+                self.log_edit.appendPlainText(
+                    "[UI] Opening region selector overlay... drag to select area, ESC for full screen"
+                )
+                # Ensure UI processes events before overlay to avoid stale frame
+                QtWidgets.QApplication.processEvents()
+                try:
+                    from .region_selector import select_region
+                except ImportError:
+                    from region_selector import select_region
+                geom = select_region(self)  # returns (x,y,w,h) or None
+                if geom:
+                    x, y, w, h = geom
+                    selected_region = [int(x), int(y), int(w), int(h)]
+                    self.log_edit.appendPlainText(
+                        f"[UI] Region selected: {selected_region}"
+                    )
+                else:
+                    self.log_edit.appendPlainText(
+                        "[UI] Region selection cancelled or too small -> using full screen"
+                    )
+                    selected_region = None
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Region Selector Error",
+                    f"Failed to select region, falling back to full screen:\n{e}",
+                )
+                selected_region = None
+        else:  # Yes = Full Screen
+            selected_region = None
+            self.log_edit.appendPlainText("[UI] Using full screen capture as selected")
+
         # collect current UI values and write to runtime config, then start in-process vision engine per new spec (no separate process)
         try:
             vals = self.collect_all_values()
+            # override capture.region with selected region for this run
+            # config schema expects null or list or empty string; we'll use list or None
+            vals["capture.region"] = selected_region if selected_region else None
+            # also update UI form field to reflect selection for transparency, but don't require save to persist unless user clicks Save config
+            # try to update All tab form widget if present
+            try:
+                # find region widget in all_form and update display string
+                if "capture.region" in self.all_form.widgets:
+                    w = self.all_form.widgets["capture.region"]
+                    if isinstance(w, QtWidgets.QLineEdit):
+                        if selected_region:
+                            w.setText(
+                                f"{selected_region[0]},{selected_region[1]},{selected_region[2]},{selected_region[3]}"
+                            )
+                        else:
+                            w.setText("")
+                # similarly update custom form if it contains region field
+                if (
+                    hasattr(self, "custom_form")
+                    and self.custom_form
+                    and "capture.region" in self.custom_form.widgets
+                ):
+                    w2 = self.custom_form.widgets["capture.region"]
+                    if isinstance(w2, QtWidgets.QLineEdit):
+                        if selected_region:
+                            w2.setText(
+                                f"{selected_region[0]},{selected_region[1]},{selected_region[2]},{selected_region[3]}"
+                            )
+                        else:
+                            w2.setText("")
+            except:
+                pass
+
             cfg = self.apply_values_to_config(vals)
             runtime_path = Path(__file__).parent.parent / "config.runtime.yaml"
             save_yaml(runtime_path, cfg)
-            self.log_edit.appendPlainText(f"[UI] Config prepared at {runtime_path}")
+            self.log_edit.appendPlainText(
+                f"[UI] Config prepared at {runtime_path} with region={selected_region if selected_region else 'full screen'}"
+            )
         except Exception as e:
             QtWidgets.QMessageBox.critical(
                 self, "Error", f"Failed to prepare config: {e}"
@@ -672,9 +760,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise RuntimeError("VisionEngine failed to start thread")
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
-            self.status_label.setText("Status: running in-process vision engine")
+            region_desc = (
+                f"region {selected_region}" if selected_region else "full screen"
+            )
+            self.status_label.setText(
+                f"Status: running in-process vision engine ({region_desc})"
+            )
             self.log_edit.appendPlainText(
-                "[UI] Vision engine started in-process thread. Screen tab should now show live video with detections."
+                f"[UI] Vision engine started in-process thread with {region_desc}. Screen tab should now show live video with detections."
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Start Failed", str(e))
