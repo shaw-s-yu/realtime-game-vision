@@ -87,14 +87,19 @@ class VisionEngine:
 
         # GPU status logging similar to main.py
         try:
-            import torch
+            import torch, os
 
-            if torch.cuda.is_available():
+            cuda_avail = torch.cuda.is_available()
+            cuda_count = torch.cuda.device_count() if cuda_avail else 0
+            cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+            if cuda_avail:
                 self.log(
-                    f"[GPU] torch CUDA available True device {torch.cuda.get_device_name(0)} torch {torch.__version__}"
+                    f"[GPU] torch CUDA available True device_count={cuda_count} device0={torch.cuda.get_device_name(0)} torch={torch.__version__} cuda_runtime={torch.version.cuda} CUDA_VISIBLE_DEVICES={cuda_vis}"
                 )
             else:
-                self.log(f"[GPU] torch CUDA False - using CPU")
+                self.log(
+                    f"[GPU] torch CUDA False - using CPU. torch={torch.__version__} cuda_runtime={torch.version.cuda} device_count={cuda_count} CUDA_VISIBLE_DEVICES={cuda_vis}. FPS will be <1 on RTX 4070. Fix applied in ui_app.py early torch import before PySide6 to avoid Qt DLL interference; if still False check: 1) nvidia-smi driver >=528, 2) python scripts/check_gpu.py outside UI shows True, 3) launch UI from activated venv PowerShell with python.exe not pythonw, 4) pip install torch --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps, 5) ensure no empty CUDA_VISIBLE_DEVICES env var."
+                )
         except Exception as e:
             self.log(f"[GPU] torch check failed {e}")
 
@@ -102,7 +107,14 @@ class VisionEngine:
             import onnxruntime as ort
 
             prov = ort.get_available_providers()
-            self.log(f"[GPU] onnxruntime providers: {prov}")
+            self.log(f"[GPU] onnxruntime {ort.__version__} providers: {prov}")
+            if (
+                "CUDAExecutionProvider" not in prov
+                and "TensorrtExecutionProvider" not in prov
+            ):
+                self.log(
+                    "[GPU] WARNING onnxruntime GPU providers missing - OCR on CPU will be slow. Fix: pip uninstall -y onnxruntime onnxruntime-gpu ; pip install onnxruntime-gpu==1.18.1 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+                )
         except Exception as e:
             self.log(f"[GPU] onnxruntime check failed {e}")
 

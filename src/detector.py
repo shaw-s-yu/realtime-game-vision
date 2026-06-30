@@ -26,6 +26,29 @@ class DetectorTracker:
     ):
         if not ULTRALYTICS_AVAILABLE:
             raise RuntimeError("ultralytics not installed. pip install ultralytics")
+        # Validate CUDA availability once at init to avoid per-frame "Invalid CUDA device" spam seen in UI logs.
+        # Root cause observed: torch.cuda.is_available() True in standalone check_gpu.py but False inside PySide6 UI process due to Qt DLL load order.
+        # Workaround applied in ui_app.py early torch import before PySide6, but double-check here and fallback gracefully with clear single warning.
+        try:
+            import torch
+
+            cuda_available = torch.cuda.is_available()
+            cuda_count = torch.cuda.device_count() if cuda_available else 0
+            req = str(device).lower()
+            if req in ("cuda", "0", "cuda:0", "cuda0"):
+                if not cuda_available or cuda_count == 0:
+                    print(
+                        '[detector] WARNING: CUDA requested but torch.cuda.is_available() is False inside UI process. Falling back to CPU - FPS will drop to <1. Fix: ensure ui_app.py imports torch before PySide6 (already in repo after fix), check nvidia-smi driver >=528, ensure CUDA_VISIBLE_DEVICES not empty string, reinstall torch with --index-url https://download.pytorch.org/whl/cu121 --force-reinstall, launch UI from activated venv PowerShell not pythonw, and verify python scripts/check_gpu.py shows True outside UI then same python -c "import torch; from PySide6 import QtWidgets; print(torch.cuda.is_available())" should also show True after fix.'
+                    )
+                    device = "cpu"
+                    half = False
+                else:
+                    device = 0 if req in ("cuda", "0") else device
+        except Exception as e:
+            print(f"[detector] CUDA check failed, falling back to cpu: {e}")
+            device = "cpu"
+            half = False
+
         self.model = YOLO(model_path)
         self.classes = classes or []
         self.conf = conf

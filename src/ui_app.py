@@ -10,6 +10,27 @@ No hot reload per spec — Start launches fresh in-process engine with snapshot 
 
 import sys
 import os
+
+# Fix CUDA unavailable inside PySide6 UI process on Windows RTX 4070:
+# PySide6 Qt platform plugin loads OpenGL/DirectX DLLs that can interfere with PyTorch CUDA context initialization
+# if torch is imported after Qt. We force torch import and CUDA init early, before PySide6, as workaround.
+# Also clean up empty CUDA_VISIBLE_DEVICES which means "no GPU" to CUDA runtime, and set lazy loading to reduce DLL conflict risk.
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+if os.environ.get("CUDA_VISIBLE_DEVICES", "") == "":
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+# Early torch import to initialize CUDA before Qt
+try:
+    import torch
+
+    _early_cuda = torch.cuda.is_available()
+    if _early_cuda:
+        # Trigger lazy context creation now while no Qt event loop running
+        _tmp = torch.zeros(1, device="cuda")
+        del _tmp
+except Exception:
+    pass
+
 import json
 import time
 from pathlib import Path
