@@ -232,11 +232,19 @@ class VisionEngine:
                         ocr_result = {"texts": [], "new_notices": [], "changed": False}
                         self._last_ocr = ocr_result
                 else:
-                    ocr_result = getattr(
+                    cached = getattr(
                         self,
                         "_last_ocr",
                         {"texts": [], "new_notices": [], "changed": False},
                     )
+                    # Reuse cached texts for overlay drawing, but never re-emit
+                    # new_notices/changed on skipped frames — those are one-shot
+                    # signals owned by the frame OCR actually ran on.
+                    ocr_result = {
+                        "texts": cached.get("texts", []),
+                        "new_notices": [],
+                        "changed": False,
+                    }
 
                 # VLM async submit
                 try:
