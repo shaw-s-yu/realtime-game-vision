@@ -210,25 +210,30 @@ class VisionEngine:
                 last_process = now
                 frame_idx += 1
                 fps_meter.tick()
+                _t_iter_start = time.perf_counter()
 
                 # Detector + tracker
+                _t0 = time.perf_counter()
                 try:
                     detections = detector.predict_track(frame)
                     detections = movement.update(detections, timestamp=now)
                 except Exception as e:
                     self.log(f"[VisionEngine] detection error: {e}")
                     detections = []
+                _t_det = (time.perf_counter() - _t0) * 1000
 
                 # OCR — fully async. Submit latest frame+detections to the OCR
                 # worker (which drops any pending job) and read whatever result
                 # it last completed. Main loop never blocks on OCR regardless
                 # of how slow RapidOCR is on text-heavy scenes.
+                _t0 = time.perf_counter()
                 try:
                     ocr.submit(frame, detections)
                     ocr_result = ocr.get_latest()
                 except Exception as e:
                     self.log(f"[VisionEngine] OCR error: {e}")
                     ocr_result = {"texts": [], "new_notices": [], "changed": False}
+                _t_ocr = (time.perf_counter() - _t0) * 1000
 
                 # VLM async submit
                 try:
@@ -238,6 +243,7 @@ class VisionEngine:
                     vlm_text = ""
 
                 # Overlay draw returns annotated BGR image, no cv2.imshow because show=False
+                _t0 = time.perf_counter()
                 try:
                     vis = overlay.draw(
                         frame,
@@ -250,14 +256,28 @@ class VisionEngine:
                 except Exception as e:
                     self.log(f"[VisionEngine] overlay error: {e}")
                     vis = frame
+                _t_ov = (time.perf_counter() - _t0) * 1000
 
                 # Emit frame to UI callback
+                _t0 = time.perf_counter()
                 if self.frame_callback:
                     try:
                         # copy to avoid threading issues with numpy mutable buffer being reused by next capture
                         self.frame_callback(vis.copy())
                     except Exception as e:
                         self.log(f"[VisionEngine] frame callback error: {e}")
+                _t_cb = (time.perf_counter() - _t0) * 1000
+                _t_iter = (time.perf_counter() - _t_iter_start) * 1000
+
+                # Per-stage timing every 20 frames — reveals whether det/ocr/overlay/cb
+                # is the bottleneck when async OCR alone doesn't recover FPS.
+                if frame_idx % 20 == 0:
+                    self.log(
+                        f"[perf] frame={frame_idx} fps={fps_meter.fps():.1f} "
+                        f"iter={_t_iter:.0f}ms det={_t_det:.0f} ocr={_t_ocr:.1f} "
+                        f"overlay={_t_ov:.0f} cb={_t_cb:.0f} "
+                        f"detN={len(detections)} textN={len(ocr_result.get('texts', []))}"
+                    )
 
                 # Log new notices
                 if ocr_result.get("new_notices"):
