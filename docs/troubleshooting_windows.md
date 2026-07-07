@@ -104,6 +104,115 @@ Even after torch CUDA True and onnxruntime CUDA, FPS can be low due to config.
 - Check Task Manager GPU CUDA graph 30-60% not 0%
 - Compare headless `python -m src.main` vs UI embedded to isolate Qt rendering overhead. If headless 15+ fps but UI <3, optimize VideoWidget to skip frames or lower width to 640.
 
+## Symptom 6a: config.runtime.yaml has `detector.device: cpu` even after edits in UI
+
+**Log pattern:** `[detector] loading yolov8s-worldv2.pt on cpu ...` (device string
+"cpu" instead of "0"), FPS ~0.5 despite torch/ORT both reporting CUDA available.
+
+**Root cause:** the UI's ComboBox for `detector.device` on the All tab isn't
+binding writes back to the in-memory config dict on some setups. Start still
+snapshots the stale value and writes `device: cpu` into `config.runtime.yaml`
+each time, so every UI edit round-trip silently reverts.
+
+**Fix — edit `config.yaml` directly, close and relaunch the UI:**
+```yaml
+detector:
+  device: cuda
+  half: true
+```
+Then `type config.runtime.yaml` after clicking Start to verify `device: cuda`
+was written. The UI reads `config.yaml` at process start so the fresh value
+propagates to future Start clicks.
+
+## Symptom 6b: FPS caps at ~2 on text-heavy scenes (Chinese login screens, dialog boxes)
+
+**Log pattern in `[perf]` line:** `overlay=400+ms` while `det=30-60 ms`.
+
+**Root cause:** overlay was doing a full-image `cv2.cvtColor(BGR->RGB) +
+Image.fromarray + np.array(pil) + cv2.cvtColor(RGB->BGR)` for every Unicode
+label drawn. 30 OCR text boxes = 30 full-image round trips per frame.
+
+**Fix already applied in repo:** `src/overlay.py` collects every Unicode label
+(OCR text + notices + VLM caption) into one `pil_items` list and calls
+`_draw_texts_pil_batch` once per frame. Overlay drops from ~450 ms to <35 ms.
+
+If you customize `overlay.py`, keep the batched-draw invariant: no per-label
+`_draw_text_pil` calls inside the draw loop. Add labels to `pil_items` and
+draw them all at the end.
+
+## Symptom 6c: FPS still low after fixing overlay — OCR blocking the main loop
+
+**Log pattern:** `ocr=1500-5000 ms` on `[perf]` line, mostly on Chinese scenes.
+
+**Root cause:** OCR was called synchronously in the main loop. RapidOCR
+processes one inference per ROI crop; on 30+ small CJK crops per frame that
+compounds to seconds per call, stalling the entire pipeline.
+
+**Fix already applied in repo:** `src/ocr.py` runs RapidOCR in a background
+worker thread. `OCRProcessor.submit(frame, detections)` drops any pending job
+and enqueues the freshest frame; `get_latest()` returns the last completed
+result immediately. The main loop calls both every frame and never blocks.
+OCR results lag reality by however long RapidOCR takes (typically 1-3 s on
+dense CJK text) — this is fine for text overlay which changes slowly.
+
+If you need synchronous OCR for some reason, `OCRProcessor.process()` is a
+compat shim that submits + returns latest, but do not expect it to be
+"fresh-for-this-frame".
+
+## Symptom 6d: FPS drops *further* when forcing GPU on RapidOCR sessions
+
+**Log pattern:** `[ocr] session providers after init: session=CUDA, session=CUDA, session=CUDA`
+and FPS drops from ~2 (CPU OCR) to ~0.3.
+
+**Root cause:** RapidOCR issues one ONNX inference per ROI crop. On 30+ small
+crops per call, per-crop CPU<->GPU sync and cuDNN convolution algorithm
+autotune (called for every unique crop shape) dominate the kernel cost.
+`onnxruntime-gpu` is only faster for large, batched, static-shape inputs.
+
+**Fix:** keep OCR on CPU. `OCRProcessor(use_gpu=False)` is the default and the
+recommended setting for this pipeline. The async worker makes CPU OCR
+effectively free from the main loop's perspective.
+
+If you want to experiment with GPU OCR anyway (e.g. batched, single large ROI
+workloads), monkey-patching `InferenceSession` on every already-imported
+`rapidocr_onnxruntime.*` submodule before calling `RapidOCR()` is the pattern
+that works (see git history around `Force RapidOCR sessions onto CUDA`) —
+patching only `onnxruntime.InferenceSession` doesn't intercept the
+`from onnxruntime import InferenceSession` binding that rapidocr uses
+internally.
+
+## Symptom 6e: Ultralytics "'half' is deprecated" floods stdout, one line per predict call
+
+**Log pattern:** dozens of `WARNING 'half' is deprecated and will be removed in the future. Use 'quantize' instead.` lines.
+
+**Root cause:** the message is emitted by Ultralytics' own logger (not the
+python `warnings` module). Ultralytics resets the logger level during `YOLO()`
+init, so `logging.getLogger("ultralytics").setLevel(ERROR)` gets clobbered.
+
+**Fix already applied in repo:** `src/detector.py` attaches a `logging.Filter`
+(runs per-record and survives level resets) to the `ultralytics`, `yolo`, and
+root loggers to drop the specific message. `warnings.filterwarnings` is kept
+as a belt-and-braces backup.
+
+## Symptom 6f: nvidia-smi shows 8% GPU util and 12W draw while app is running — is GPU really being used?
+
+Both can be true at 10 FPS with a small YOLO model:
+- Each inference bursts to 40-80% util for ~30 ms
+- Between bursts (100 ms budget - 30 ms = 70 ms idle), GPU sleeps to P8
+- `nvidia-smi` sampling often lands in the idle gap → shows near-zero util
+
+**Better diagnostics:**
+- Look at the `[perf]` line in the Screen tab log — `det` in ms is the truth
+- `nvidia-smi -l 1` for continuous sampling, look at peaks not mean
+- The `[detector]` startup line prints `on 0 ...` for cuda:0 or `on cpu ...`;
+  device 0 is unambiguous proof YOLO chose GPU
+
+**Also watch out for the venv/base-python nvidia-smi display quirk:** on
+Windows the process name column may resolve a venv Python to its base install
+image path (`AppData\Local\Programs\Python\Python311\python.exe`) even when
+the app is genuinely running from `.venv\Scripts\python.exe`. Not a bug in
+your app, just how the process name lookup works.
+
 ## Symptom 7: git fetch bad object error
 
 **Error:** `fatal: bad object refs/heads/main` `did not send all necessary objects`

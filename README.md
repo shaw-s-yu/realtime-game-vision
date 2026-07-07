@@ -16,11 +16,22 @@ OpenCUA repo you cloned is useful as reference for action schema and evaluation,
 ```
 dxcam capture (BGRA, 30 fps grab, process latest)
   -> resize 1280x720
-  -> YOLO-World / YOLO11n detect  -> ByteTrack IDs -> velocity
-  -> RapidOCR PP-OCRv4  -> text boxes, diff vs prev for notices
-  -> optional Moondream2 / Florence-2 / Qwen2.5-VL-3B via Ollama every N frames
-  -> fuse -> cv2 overlay / JSON callback
+  -> YOLO-World / YOLO11n detect (GPU)  -> ByteTrack IDs -> velocity
+  -> RapidOCR PP-OCRv4  -> text boxes, diff vs prev for notices        [async worker]
+  -> optional Moondream2 / Florence-2 / Qwen2.5-VL-3B via Ollama       [async worker]
+  -> fuse -> single-pass PIL/cv2 overlay -> JSON callback
 ```
+
+**OCR and VLM run in background threads.** The main pipeline submits the latest
+frame to each worker and immediately reads whatever result they last produced;
+neither ever blocks the loop. On text-heavy scenes RapidOCR can take 1-5 s per
+call, so async is essential — see `src/ocr.py` (`OCRProcessor._run_worker`) and
+`src/vlm_client.py` for the pattern.
+
+**Overlay batches Unicode text.** All CJK labels rendered in one BGR->PIL->BGR
+round trip per frame instead of per-label — see `src/overlay.py`
+(`_draw_texts_pil_batch`). A per-label round trip was pinning FPS at ~2 on
+Chinese login screens with 30+ text regions.
 
 ## Quick start on Windows
 
@@ -101,10 +112,12 @@ tracker:
 
 ocr:
   enabled: true
-  lang: "en"
+  lang: "en"       # or "ch" for Chinese, "jp" etc.
   det_thresh: 0.3
   rec_thresh: 0.5
-  use_gpu: true
+  use_gpu: false   # keep false: RapidOCR runs one inference per ROI crop, so
+                   # per-crop CPU<->GPU sync + cuDNN autotune makes GPU *slower*
+                   # than CPU on this workload. OCR runs async anyway so CPU is fine.
   roi_only: true   # only OCR inside detected text-like boxes to save time
 
 vlm:
@@ -141,9 +154,17 @@ src/
   capture.py         dxcam wrapper with fallback to mss
   detector.py        Ultralytics YOLO-World / YOLO wrapper
   tracker.py         ByteTrack wrapper
-  ocr.py             RapidOCR ONNX wrapper with diffing, Chinese support
-  vlm_client.py      Ollama client async
-  overlay.py         draws annotations onto numpy BGR frame, returns image without cv2.imshow when embedded
+  ocr.py             RapidOCR ONNX wrapper with diffing, Chinese support. Runs
+                     inference in a background worker (OCRProcessor._run_worker);
+                     main loop submits latest frame + reads last result, never
+                     blocks. Critical for text-heavy scenes where OCR can take
+                     1-5 s per call
+  vlm_client.py      Ollama client async — same worker pattern as ocr.py
+  overlay.py         draws annotations onto numpy BGR frame. All Unicode text
+                     (OCR labels, notices, VLM caption) collected into one
+                     _draw_texts_pil_batch call per frame — one BGR<->PIL round
+                     trip regardless of label count. Fixed the ~450 ms/frame
+                     regression from doing one round trip per label
   utils.py           fps meter, config load
 config.yaml          default persisted config loaded by UI on startup
 ui_custom.json       UI custom pane field selection persisted separately
@@ -198,17 +219,41 @@ For C# WPF alternative see `ui-csharp/` folder README — same yaml file contrac
 
 ## Performance targets measured
 
-| Component | RTX 3060 Laptop | CPU i7 no GPU |
-|-----------|-----------------|---------------|
-| dxcam capture | 5-10 ms | 5-10 ms |
-| resize 1280 | 2 ms | 2 ms |
-| YOLO-World-S detect+track | 18-28 ms FP16 | 55-80 ms OpenVINO |
-| RapidOCR full frame | 12-18 ms onnxruntime-gpu | 35-50 ms CPU |
-| RapidOCR ROI only | 5-8 ms | 12-20 ms |
-| Moondream2 via Ollama | 45-75 ms | 250-400 ms |
-| Total pipeline no VLM | 35-55 ms | 80-110 ms |
+Per-frame stage cost measured on RTX 4070 Windows 11, YOLO-World-S detector,
+Chinese OCR on a text-heavy MMO login screen (~30 text regions):
 
-10 FPS = 100 ms budget, so GPU path has 2x headroom, CPU path borderline but OK at 960 width.
+| Stage | Cost | Notes |
+|-------|------|-------|
+| dxcam capture + resize | 5-10 ms | negligible |
+| YOLO-World-S track (GPU) | 30-50 ms | main loop, on device 0 |
+| OCR submit + get_latest | 1-3 ms | non-blocking, worker thread handles real work |
+| Overlay draw (batched PIL) | 15-35 ms | one BGR<->PIL round trip per frame |
+| UI frame callback | 1-3 ms | Qt QImage repaint |
+| **Total main-loop iter** | **50-90 ms** | **~10 FPS at `process_fps: 10` cap** |
+
+Background workers (do not affect main loop FPS):
+
+| Worker | Cost per call | Result lag |
+|--------|---------------|------------|
+| RapidOCR (CPU, ROI) on 30 CJK regions | 1500-3500 ms | 1-3 s behind live |
+| Moondream2 via Ollama (GPU) | 45-75 ms | 1 frame |
+| Moondream2 via Ollama (CPU) | 250-400 ms | 3-4 frames |
+
+10 FPS = 100 ms budget → GPU path has ~30-50 ms headroom. Bump
+`capture.process_fps` to 12-15 if `[perf]` iter lines stay well under 100 ms.
+
+### Per-stage timing log
+
+`vision_engine._run_loop` emits a `[perf]` line every 20 frames:
+
+```
+[perf] frame=100 fps=8.5 iter=57ms det=35 ocr=1.0 overlay=17 cb=1 detN=0 textN=30
+```
+
+Use this to pin bottlenecks: if `overlay` climbs above 100 ms you likely have
+many OCR text boxes and either the batch call is unbatched again or the CJK
+font is expensive; if `det` climbs, swap to `yolo11n.pt`; if `cb` climbs, Qt
+image conversion is the culprit — lower `output_width` from 1280 to 960.
 
 ## Troubleshooting Windows
 
