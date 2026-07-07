@@ -1,7 +1,10 @@
 """Ultralytics YOLO detector + tracker wrapper."""
 
+import warnings
 from typing import List, Dict, Any
 import numpy as np
+
+warnings.filterwarnings("ignore", message=r".*'half' is deprecated.*")
 
 try:
     from ultralytics import YOLO

@@ -219,12 +219,24 @@ class VisionEngine:
                     self.log(f"[VisionEngine] detection error: {e}")
                     detections = []
 
-                # OCR
-                try:
-                    ocr_result = ocr.process(frame, detections)
-                except Exception as e:
-                    self.log(f"[VisionEngine] OCR error: {e}")
-                    ocr_result = {"texts": [], "new_notices": [], "changed": False}
+                # OCR — throttled to every N frames, cache last result between runs.
+                # OCR is the dominant per-frame cost on text-heavy scenes (Chinese login screens
+                # etc.), and text changes slowly enough that running it every 5th frame is fine.
+                OCR_EVERY_N = 5
+                if frame_idx == 1 or frame_idx % OCR_EVERY_N == 0:
+                    try:
+                        ocr_result = ocr.process(frame, detections)
+                        self._last_ocr = ocr_result
+                    except Exception as e:
+                        self.log(f"[VisionEngine] OCR error: {e}")
+                        ocr_result = {"texts": [], "new_notices": [], "changed": False}
+                        self._last_ocr = ocr_result
+                else:
+                    ocr_result = getattr(
+                        self,
+                        "_last_ocr",
+                        {"texts": [], "new_notices": [], "changed": False},
+                    )
 
                 # VLM async submit
                 try:

@@ -71,6 +71,55 @@ class OCRProcessor:
                 self.ocr = ocr_obj
                 print(f"[ocr] RapidOCR initialized lang={lang} use_gpu={use_gpu}")
 
+                # rapidocr-onnxruntime ignores use_gpu/device kwargs in most versions,
+                # so the internal ONNX sessions default to CPU even when onnxruntime-gpu
+                # is installed. Force each sub-model's session to CUDA by rebuilding it
+                # with explicit providers, using whichever model_path attribute the
+                # installed version exposes.
+                if use_gpu:
+                    try:
+                        import onnxruntime as ort
+
+                        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                        swapped = []
+                        failed = []
+                        for attr in ["text_det", "text_rec", "text_cls"]:
+                            sub = getattr(self.ocr, attr, None)
+                            if sub is None:
+                                continue
+                            sess = getattr(sub, "session", None)
+                            if sess is None:
+                                continue
+                            model_path = None
+                            for candidate in [
+                                getattr(sub, "_model_path", None),
+                                getattr(sub, "model_path", None),
+                                getattr(sess, "_model_path", None),
+                            ]:
+                                if candidate:
+                                    model_path = candidate
+                                    break
+                            if not model_path:
+                                failed.append(f"{attr}:no-model-path")
+                                continue
+                            try:
+                                sub.session = ort.InferenceSession(
+                                    str(model_path), providers=providers
+                                )
+                                swapped.append(
+                                    f"{attr}:{sub.session.get_providers()[0]}"
+                                )
+                            except Exception as se:
+                                failed.append(f"{attr}:{type(se).__name__}")
+                        if swapped:
+                            print(f"[ocr] forced GPU sessions: {swapped}")
+                        if failed:
+                            print(
+                                f"[ocr] could not force some sessions to GPU: {failed}"
+                            )
+                    except Exception as e:
+                        print(f"[ocr] GPU force step failed: {e}")
+
                 # Log which onnx providers RapidOCR actually ended up using
                 try:
                     import onnxruntime as ort
