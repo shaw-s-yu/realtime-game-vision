@@ -1,11 +1,17 @@
 """
 Cross-platform screen region selector using PySide6.
 Shows fullscreen semi-transparent overlay covering full virtual desktop across all monitors.
-User can click-drag anywhere on screen to draw rectangle. Press ESC to cancel (full screen), Enter to confirm, or release mouse to confirm.
-Returns [left, top, width, height] in global screen coordinates suitable for dxcam region or mss.
+User can click-drag anywhere on screen to draw rectangle. Release mouse or press Enter to confirm.
+ESC returns None (interpreted by caller as "use full screen").
+Right-click returns the CANCELLED sentinel — caller should abort the whole Start flow, not fall back to full screen.
+Returns [left, top, width, height] in global screen coordinates suitable for dxcam region or mss, or None, or CANCELLED.
 Works on Windows Linux macOS via Qt screen geometry APIs.
-Improved per spec: instructional banner spans full width top, mouse press works anywhere on screen not just small label area.
 """
+
+# Sentinel returned by select_region() when the user right-clicked to cancel.
+# Distinct from None (which means "no region -> use full screen") so callers
+# can distinguish "abort the whole operation" from "fall back to full screen".
+CANCELLED = object()
 
 try:
     from PySide6 import QtWidgets, QtCore, QtGui
@@ -64,8 +70,9 @@ class RegionSelector(QtWidgets.QWidget):
         self.start_pos = None
         self.current_pos = None
         self.selected_rect = None  # QRect in global screen coordinates
+        self.cancelled = False  # set True when user right-clicks to cancel outright
 
-        self.instruction_text = "Drag anywhere to select region to crop for vision • Release to confirm • ESC = Full Screen • Enter = Confirm"
+        self.instruction_text = "Drag anywhere to select region to crop for vision • Release to confirm • Right-click = Cancel • ESC = Full Screen • Enter = Confirm"
         # No QLabel widget used to avoid blocking mouse events; text drawn directly in paintEvent full width banner per spec fix.
 
     def keyPressEvent(self, event):
@@ -92,6 +99,17 @@ class RegionSelector(QtWidgets.QWidget):
             self.start_pos = global_pos
             self.current_pos = global_pos
             self.update()
+        elif event.button() == QtCore.Qt.RightButton:
+            # Right-click cancels the crop outright — distinct from ESC which
+            # returns None ("use full screen"). Setting cancelled=True causes
+            # select_region() to return the CANCELLED sentinel so the caller
+            # can abort whatever flow triggered the selection instead of
+            # silently falling back to full-screen capture.
+            self.start_pos = None
+            self.current_pos = None
+            self.selected_rect = None
+            self.cancelled = True
+            self.close()
 
     def mouseMoveEvent(self, event):
         if self.start_pos:
@@ -227,12 +245,16 @@ def select_region(parent=None):
     # Simpler: we already stored in selector.selected_rect before close, but after destroyed we lose object. Let's change implementation to use dialog exec style with custom signal instead for robustness in future, but for now assume selector still accessible via closure variable captured before destroy? Actually we hooked destroyed to quit loop, so after loop.exec returns, selector may already be deleted, but Python wrapper may still hold reference until function exit because we created it locally. Let's attempt safe retrieval via attribute if still valid else return None.
     try:
         rect = selector.selected_rect
+        cancelled = getattr(selector, "cancelled", False)
     except:
         rect = None
+        cancelled = False
     try:
         selector.deleteLater()
     except:
         pass
+    if cancelled:
+        return CANCELLED
     if rect is None:
         return None
     return [rect.x(), rect.y(), rect.width(), rect.height()]

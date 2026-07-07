@@ -684,7 +684,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # launch region selector overlay full screen per spec fix: user can start crop anywhere, instructional banner full width
             try:
                 self.log_edit.appendPlainText(
-                    "[UI] Opening fullscreen region selector overlay... drag anywhere to select region, ESC for full screen, Enter to confirm."
+                    "[UI] Opening fullscreen region selector overlay... drag to select region, right-click to cancel, ESC for full screen, Enter to confirm."
                 )
                 # hide main UI window temporarily for clean crop experience as per spec improvement
                 was_visible = self.isVisible()
@@ -694,15 +694,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 time.sleep(0.15)
                 try:
-                    from .region_selector import select_region
+                    from .region_selector import select_region, CANCELLED
                 except ImportError:
-                    from region_selector import select_region
-                geom = select_region()  # returns (x,y,w,h) or None
+                    from region_selector import select_region, CANCELLED
+                geom = select_region()  # (x,y,w,h) | None (full screen) | CANCELLED
                 # restore main window
                 if was_visible:
                     self.show()
                     self.raise_()
                     self.activateWindow()
+                if geom is CANCELLED:
+                    self.log_edit.appendPlainText(
+                        "[UI] Start cancelled by right-click on region selector"
+                    )
+                    return
                 if geom:
                     x, y, w, h = geom
                     selected_region = [int(x), int(y), int(w), int(h)]
