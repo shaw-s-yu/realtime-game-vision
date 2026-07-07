@@ -146,6 +146,8 @@ class Overlay:
         trail_length=15,
         show_labels=True,
         show_ocr=True,
+        ocr_color=(255, 180, 0),  # BGR — default orange for OCR text + boxes
+        fps_color=(0, 255, 255),  # BGR — default yellow for FPS HUD
     ):
         self.show = show
         self.show_fps = show_fps
@@ -153,6 +155,11 @@ class Overlay:
         self.trail_length = trail_length
         self.show_labels = show_labels
         self.show_ocr = show_ocr
+        # Live-updatable colors (BGR tuples). Assignment is GIL-atomic so the
+        # UI thread can swap these while the engine thread reads them in
+        # draw() without a lock.
+        self.ocr_color = tuple(ocr_color)
+        self.fps_color = tuple(fps_color)
         if SV_AVAILABLE:
             self.box_annotator = sv.BoxAnnotator(thickness=2)
             self.label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
@@ -160,6 +167,16 @@ class Overlay:
                 thickness=2, trace_length=trail_length
             )
         self.window_name = "Realtime Game Vision - press q to quit, s to save"
+
+    def set_ocr_color(self, bgr):
+        """Set OCR label/box color. Accepts (b, g, r) ints 0-255."""
+        b, g, r = bgr
+        self.ocr_color = (int(b) & 0xFF, int(g) & 0xFF, int(r) & 0xFF)
+
+    def set_fps_color(self, bgr):
+        """Set FPS HUD color. Accepts (b, g, r) ints 0-255."""
+        b, g, r = bgr
+        self.fps_color = (int(b) & 0xFF, int(g) & 0xFF, int(r) & 0xFF)
 
     def draw(
         self, frame, detections, ocr_result, movement_tracker, fps=None, vlm_text=""
@@ -214,12 +231,17 @@ class Overlay:
         # BGR->PIL->BGR round trip is ~30x cheaper than one round trip per label.
         pil_items = []
 
+        # Snapshot mutable colors once per draw so a UI-thread swap mid-frame
+        # can't produce inconsistent BGR triples across box, text, and HUD.
+        ocr_bgr = self.ocr_color
+        fps_bgr = self.fps_color
+
         # OCR boxes: rectangles now, text queued for batch
         if self.show_ocr and ocr_result and ocr_result.get("texts"):
             for t in ocr_result["texts"]:
                 x1, y1, x2, y2 = t["x1"], t["y1"], t["x2"], t["y2"]
-                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 180, 0), 1)
-                pil_items.append((t["text"][:30], (x1, y2 + 2), (255, 180, 0), 16))
+                cv2.rectangle(img, (x1, y1), (x2, y2), ocr_bgr, 1)
+                pil_items.append((t["text"][:30], (x1, y2 + 2), ocr_bgr, 16))
 
         # HUD - ASCII FPS stays on cv2 (fast), notices/VLM join the PIL batch
         y = 25
@@ -230,7 +252,7 @@ class Overlay:
                 (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (0, 255, 255),
+                fps_bgr,
                 2,
             )
             y += 28

@@ -35,6 +35,14 @@ class VisionEngine:
         self._stop_event = threading.Event()
         self._thread = None
         self._running = False
+        # Overlay reference exposed after _run_loop constructs it so the UI
+        # thread can push live color updates. None until start() has begun.
+        self.overlay = None
+        # Colors requested by the UI *before* the engine has spun up. When
+        # _run_loop creates the Overlay it seeds these into the constructor,
+        # so a color chosen while stopped is honored on the next Start.
+        self._pending_ocr_color = None
+        self._pending_fps_color = None
 
     def log(self, msg):
         if self.log_callback:
@@ -66,6 +74,20 @@ class VisionEngine:
 
     def is_running(self):
         return self._running and self._thread and self._thread.is_alive()
+
+    def set_ocr_color(self, bgr):
+        """Update OCR label color live. Safe to call from the UI thread; if
+        the engine hasn't started yet the value is remembered and applied when
+        the Overlay is constructed."""
+        self._pending_ocr_color = tuple(bgr)
+        if self.overlay is not None:
+            self.overlay.set_ocr_color(bgr)
+
+    def set_fps_color(self, bgr):
+        """Update FPS HUD color live. Same semantics as set_ocr_color."""
+        self._pending_fps_color = tuple(bgr)
+        if self.overlay is not None:
+            self.overlay.set_fps_color(bgr)
 
     def _run_loop(self):
         try:
@@ -174,7 +196,7 @@ class VisionEngine:
             vlm.start()
             self.log("[VisionEngine] VLM worker started")
 
-        overlay = Overlay(
+        overlay_kwargs = dict(
             show=False,  # never show cv2 window when embedded in UI, UI will display returned image
             show_fps=over_cfg.get("show_fps", True),
             show_trails=over_cfg.get("show_trails", True),
@@ -182,6 +204,18 @@ class VisionEngine:
             show_labels=over_cfg.get("show_labels", True),
             show_ocr=over_cfg.get("show_ocr", True),
         )
+        # Honor colors chosen from the UI before Start; otherwise pick up
+        # persisted color from config; otherwise fall back to Overlay defaults.
+        if self._pending_ocr_color is not None:
+            overlay_kwargs["ocr_color"] = self._pending_ocr_color
+        elif over_cfg.get("ocr_color"):
+            overlay_kwargs["ocr_color"] = tuple(over_cfg["ocr_color"])
+        if self._pending_fps_color is not None:
+            overlay_kwargs["fps_color"] = self._pending_fps_color
+        elif over_cfg.get("fps_color"):
+            overlay_kwargs["fps_color"] = tuple(over_cfg["fps_color"])
+        overlay = Overlay(**overlay_kwargs)
+        self.overlay = overlay
 
         fps_meter = FPSMeter()
         save_dir = Path(out_cfg.get("save_dir", "captures"))
@@ -302,5 +336,6 @@ class VisionEngine:
                 capture.stop()
             except:
                 pass
+            self.overlay = None
             self._running = False
             self.log("[VisionEngine] stopped")

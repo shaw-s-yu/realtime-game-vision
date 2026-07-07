@@ -473,6 +473,26 @@ class MainWindow(QtWidgets.QMainWindow):
         # Screen tab with 2 sections: video display on top, process log below. No log elsewhere per spec.
         screen_tab = QtWidgets.QWidget()
         screen_vbox = QtWidgets.QVBoxLayout(screen_tab)
+
+        # Live overlay-color pickers — real-time update while engine is running,
+        # or persisted until next Start if engine is stopped.
+        # Defaults match Overlay: OCR orange (R255,G180,B0), FPS yellow (R255,G255,B0).
+        self.ui_overlay_ocr_color = QtGui.QColor(255, 180, 0)
+        self.ui_overlay_fps_color = QtGui.QColor(255, 255, 0)
+        color_bar = QtWidgets.QHBoxLayout()
+        color_bar.addWidget(QtWidgets.QLabel("Overlay colors:"))
+        self.ocr_color_btn = QtWidgets.QPushButton("OCR Label")
+        self.ocr_color_btn.setToolTip("Color for OCR text and its bounding box")
+        self.ocr_color_btn.clicked.connect(self._on_pick_ocr_color)
+        color_bar.addWidget(self.ocr_color_btn)
+        self.fps_color_btn = QtWidgets.QPushButton("FPS")
+        self.fps_color_btn.setToolTip("Color for the top-left FPS overlay")
+        self.fps_color_btn.clicked.connect(self._on_pick_fps_color)
+        color_bar.addWidget(self.fps_color_btn)
+        color_bar.addStretch(1)
+        screen_vbox.addLayout(color_bar)
+        self._restyle_color_buttons()
+
         # video display area
         video_group = QtWidgets.QGroupBox("Screen and Detection - Realtime")
         video_layout = QtWidgets.QVBoxLayout()
@@ -644,6 +664,67 @@ class MainWindow(QtWidgets.QMainWindow):
         except:
             pass
 
+    def _restyle_color_buttons(self):
+        """Paint each color-picker button with its current color as background
+        so the user can see the active choice at a glance."""
+        for btn, qc in (
+            (self.ocr_color_btn, self.ui_overlay_ocr_color),
+            (self.fps_color_btn, self.ui_overlay_fps_color),
+        ):
+            # Pick contrasting text color via YIQ luminance to stay readable.
+            r, g, b = qc.red(), qc.green(), qc.blue()
+            luma = (r * 299 + g * 587 + b * 114) / 1000
+            fg = "#000000" if luma > 128 else "#ffffff"
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: {qc.name()}; color: {fg}; "
+                f"padding: 4px 12px; border: 1px solid #444; border-radius: 3px; }}"
+            )
+
+    def _qcolor_to_bgr(self, qc):
+        return (qc.blue(), qc.green(), qc.red())
+
+    def _push_color_to_engine(self, kind, qc):
+        """Forward color to the running engine's overlay if any; otherwise
+        the value stays remembered and is applied on next Start via
+        VisionEngine._pending_*_color."""
+        engine = getattr(self, "vision_engine", None)
+        if engine is None:
+            return
+        bgr = self._qcolor_to_bgr(qc)
+        try:
+            if kind == "ocr":
+                engine.set_ocr_color(bgr)
+            elif kind == "fps":
+                engine.set_fps_color(bgr)
+        except Exception as e:
+            self.log_edit.appendPlainText(f"[UI] color update failed: {e}")
+
+    def _on_pick_ocr_color(self):
+        qc = QtWidgets.QColorDialog.getColor(
+            self.ui_overlay_ocr_color, self, "Pick OCR label color"
+        )
+        if not qc.isValid():
+            return
+        self.ui_overlay_ocr_color = qc
+        self._restyle_color_buttons()
+        self._push_color_to_engine("ocr", qc)
+        self.log_edit.appendPlainText(
+            f"[UI] OCR label color set to {qc.name()} (RGB {qc.red()},{qc.green()},{qc.blue()})"
+        )
+
+    def _on_pick_fps_color(self):
+        qc = QtWidgets.QColorDialog.getColor(
+            self.ui_overlay_fps_color, self, "Pick FPS overlay color"
+        )
+        if not qc.isValid():
+            return
+        self.ui_overlay_fps_color = qc
+        self._restyle_color_buttons()
+        self._push_color_to_engine("fps", qc)
+        self.log_edit.appendPlainText(
+            f"[UI] FPS overlay color set to {qc.name()} (RGB {qc.red()},{qc.green()},{qc.blue()})"
+        )
+
     def on_start(self):
         # check if already running
         if (
@@ -804,6 +885,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 config_path=str(runtime_path),
                 frame_callback=frame_cb,
                 log_callback=log_cb,
+            )
+            # Seed the current UI-picked overlay colors so the Overlay is
+            # constructed with them on first draw (no flicker of the default
+            # orange/yellow before the first UI push).
+            self.vision_engine.set_ocr_color(
+                self._qcolor_to_bgr(self.ui_overlay_ocr_color)
+            )
+            self.vision_engine.set_fps_color(
+                self._qcolor_to_bgr(self.ui_overlay_fps_color)
             )
             started = self.vision_engine.start()
             if not started:
