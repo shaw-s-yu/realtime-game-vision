@@ -219,32 +219,16 @@ class VisionEngine:
                     self.log(f"[VisionEngine] detection error: {e}")
                     detections = []
 
-                # OCR — throttled to every N frames, cache last result between runs.
-                # OCR is the dominant per-frame cost on text-heavy scenes (Chinese login screens
-                # etc.), and text changes slowly enough that running it every 5th frame is fine.
-                OCR_EVERY_N = 5
-                if frame_idx == 1 or frame_idx % OCR_EVERY_N == 0:
-                    try:
-                        ocr_result = ocr.process(frame, detections)
-                        self._last_ocr = ocr_result
-                    except Exception as e:
-                        self.log(f"[VisionEngine] OCR error: {e}")
-                        ocr_result = {"texts": [], "new_notices": [], "changed": False}
-                        self._last_ocr = ocr_result
-                else:
-                    cached = getattr(
-                        self,
-                        "_last_ocr",
-                        {"texts": [], "new_notices": [], "changed": False},
-                    )
-                    # Reuse cached texts for overlay drawing, but never re-emit
-                    # new_notices/changed on skipped frames — those are one-shot
-                    # signals owned by the frame OCR actually ran on.
-                    ocr_result = {
-                        "texts": cached.get("texts", []),
-                        "new_notices": [],
-                        "changed": False,
-                    }
+                # OCR — fully async. Submit latest frame+detections to the OCR
+                # worker (which drops any pending job) and read whatever result
+                # it last completed. Main loop never blocks on OCR regardless
+                # of how slow RapidOCR is on text-heavy scenes.
+                try:
+                    ocr.submit(frame, detections)
+                    ocr_result = ocr.get_latest()
+                except Exception as e:
+                    self.log(f"[VisionEngine] OCR error: {e}")
+                    ocr_result = {"texts": [], "new_notices": [], "changed": False}
 
                 # VLM async submit
                 try:
@@ -288,6 +272,10 @@ class VisionEngine:
             try:
                 if vlm.enabled:
                     vlm.stop()
+            except:
+                pass
+            try:
+                ocr.stop()
             except:
                 pass
             try:

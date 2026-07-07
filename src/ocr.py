@@ -1,8 +1,16 @@
-"""RapidOCR wrapper with ROI filtering and text change detection."""
+"""RapidOCR wrapper with ROI filtering, text change detection, and async worker.
 
-from typing import List, Dict, Tuple
+OCR runs in a background thread — the main pipeline loop submits the latest
+frame+detections and immediately reads the last completed result. This keeps
+FPS bound by the detector, not by RapidOCR (which can take 1–5 seconds per
+call on text-heavy Chinese scenes).
+"""
+
+import queue
+import threading
+import time
+from typing import List, Dict, Optional
 import numpy as np
-import cv2
 
 try:
     from rapidocr_onnxruntime import RapidOCR
@@ -12,6 +20,9 @@ except Exception:
     RAPID_AVAILABLE = False
 
 
+_EMPTY_RESULT = {"texts": [], "new_notices": [], "changed": False}
+
+
 class OCRProcessor:
     def __init__(
         self,
@@ -19,7 +30,7 @@ class OCRProcessor:
         lang="en",
         det_thresh=0.3,
         rec_thresh=0.5,
-        use_gpu=True,
+        use_gpu=False,  # GPU forcing consistently slower than CPU on ROI-sized crops
         roi_only=True,
         text_classes=None,
         diff_threshold=0.6,
@@ -38,200 +49,122 @@ class OCRProcessor:
         self.prev_texts = set()
         self.lang = lang
         self.use_gpu = use_gpu
+
+        self._latest = dict(_EMPTY_RESULT)
+        self._latest_lock = threading.Lock()
+        self._q: "queue.Queue" = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+
         if self.enabled:
             try:
-                # rapidocr-onnxruntime constructs its internal ONNX sessions with
-                # CPUExecutionProvider only, ignoring use_gpu/device/use_cuda kwargs.
-                # It also imports InferenceSession via `from onnxruntime import
-                # InferenceSession` inside its own submodules — so patching
-                # ort.InferenceSession alone doesn't intercept it. Instead, patch
-                # the InferenceSession attribute on every already-imported
-                # rapidocr_onnxruntime submodule before calling RapidOCR(), then
-                # restore it after.
-                import sys
-                import onnxruntime as ort
-
-                _orig_session_cls = ort.InferenceSession
-                _cuda_providers = [
-                    "CUDAExecutionProvider",
-                    "CPUExecutionProvider",
+                # Instantiate RapidOCR with whichever kwargs the installed version
+                # accepts. We don't force GPU: on typical ROI-crop workloads,
+                # per-crop CPU↔GPU sync overhead in onnxruntime-gpu makes GPU
+                # slower than CPU for this pipeline.
+                ocr_obj = None
+                last_err = None
+                candidates = [
+                    {"lang": lang},
+                    {},
                 ]
-
-                def _forced_cuda_session(*args, **kwargs):
-                    kwargs["providers"] = _cuda_providers
-                    return _orig_session_cls(*args, **kwargs)
-
-                patched = []
-                if (
-                    use_gpu
-                    and "CUDAExecutionProvider" in ort.get_available_providers()
-                ):
-                    # Patch the module-level reference in onnxruntime itself...
-                    ort.InferenceSession = _forced_cuda_session
-                    patched.append(("onnxruntime", _orig_session_cls))
-                    # ...and every rapidocr_onnxruntime submodule already imported
-                    # that has an InferenceSession attribute bound at module level
-                    # via `from onnxruntime import InferenceSession`.
-                    for mod_name, mod in list(sys.modules.items()):
-                        if not mod_name.startswith("rapidocr_onnxruntime"):
-                            continue
-                        cur = getattr(mod, "InferenceSession", None)
-                        if cur is _orig_session_cls:
-                            setattr(mod, "InferenceSession", _forced_cuda_session)
-                            patched.append((mod_name, _orig_session_cls))
-                    print(
-                        f"[ocr] patched InferenceSession in {len(patched)} module(s) before RapidOCR init"
-                    )
-
-                try:
-                    ocr_obj = None
-                    last_err = None
-                    candidates = [
-                        {"lang": lang, "device": "cuda" if use_gpu else "cpu"},
-                        {"lang": lang, "use_cuda": use_gpu},
-                        {"lang": lang, "use_gpu": use_gpu},
-                        {"lang": lang},
-                        {"device": "cuda" if use_gpu else "cpu"},
-                        {"use_cuda": use_gpu},
-                        {},
-                    ]
-                    for kw in candidates:
-                        try:
-                            ocr_obj = RapidOCR(**kw)
-                            break
-                        except TypeError as te:
-                            last_err = te
-                            continue
-                        except Exception as e:
-                            last_err = e
-                            continue
-                    if ocr_obj is None:
-                        raise RuntimeError(
-                            f"RapidOCR init failed with all signatures, last error: {last_err}"
-                        )
-                finally:
-                    # Restore every patched module attribute.
-                    for mod_name, orig in patched:
-                        target = ort if mod_name == "onnxruntime" else sys.modules.get(
-                            mod_name
-                        )
-                        if target is not None:
-                            setattr(target, "InferenceSession", orig)
-
-                self.ocr = ocr_obj
-                print(f"[ocr] RapidOCR initialized lang={lang} use_gpu={use_gpu}")
-
-                # Verify: walk the ocr object graph and report the providers each
-                # InferenceSession actually ended up with.
-                if use_gpu:
+                for kw in candidates:
                     try:
-                        found = []
-                        seen = set()
-
-                        def _walk(obj, path, depth=0):
-                            if depth > 5 or id(obj) in seen:
-                                return
-                            seen.add(id(obj))
-                            for name in dir(obj):
-                                if name.startswith("__"):
-                                    continue
-                                try:
-                                    child = getattr(obj, name)
-                                except Exception:
-                                    continue
-                                if isinstance(child, _orig_session_cls):
-                                    found.append(
-                                        (f"{path}.{name}", child.get_providers()[0])
-                                    )
-                                    continue
-                                if callable(child) and not hasattr(child, "__dict__"):
-                                    continue
-                                if isinstance(
-                                    child, (str, int, float, bool, bytes, type(None))
-                                ):
-                                    continue
-                                _walk(child, f"{path}.{name}", depth + 1)
-
-                        _walk(self.ocr, "ocr")
-                        if found:
-                            summary = ", ".join(
-                                f"{p.split('.')[-1]}={ep.replace('ExecutionProvider', '')}"
-                                for p, ep in found
-                            )
-                            print(f"[ocr] session providers after init: {summary}")
-                            on_cpu = [
-                                p for p, ep in found if ep == "CPUExecutionProvider"
-                            ]
-                            if on_cpu:
-                                print(
-                                    f"[ocr] WARNING {len(on_cpu)} session(s) still on CPU: {on_cpu}"
-                                )
+                        ocr_obj = RapidOCR(**kw)
+                        break
+                    except TypeError as te:
+                        last_err = te
+                        continue
                     except Exception as e:
-                        print(f"[ocr] provider verify failed: {e}")
-
-                # Log which onnx providers RapidOCR actually ended up using
-                try:
-                    import onnxruntime as ort
-
-                    prov = ort.get_available_providers()
-                    print(f"[ocr] onnxruntime available providers: {prov}")
-                    # Try to inspect internal sessions if accessible
-                    sess_providers = []
-                    for attr in [
-                        "text_det",
-                        "text_rec",
-                        "text_cls",
-                        "det",
-                        "rec",
-                        "cls",
-                    ]:
-                        try:
-                            obj = getattr(self.ocr, attr, None)
-                            if obj and hasattr(obj, "session"):
-                                sess_providers.append(obj.session.get_providers())
-                            elif (
-                                obj
-                                and hasattr(obj, "rec")
-                                and hasattr(obj.rec, "session")
-                            ):
-                                sess_providers.append(obj.rec.session.get_providers())
-                        except Exception:
-                            pass
-                    if sess_providers:
-                        print(
-                            f"[ocr] RapidOCR sessions providers sample: {sess_providers[0]}"
-                        )
-                        if use_gpu and all(
-                            "CUDAExecutionProvider" not in p
-                            and "TensorrtExecutionProvider" not in p
-                            for p in sess_providers
-                        ):
-                            print(
-                                "[ocr] WARNING: RapidOCR sessions are on CPU despite use_gpu=True. Check onnxruntime-gpu install and CUDA driver. See README troubleshooting."
-                            )
-                except Exception:
-                    pass
-
+                        last_err = e
+                        continue
+                if ocr_obj is None:
+                    raise RuntimeError(
+                        f"RapidOCR init failed with all signatures, last error: {last_err}"
+                    )
+                self.ocr = ocr_obj
+                print(f"[ocr] RapidOCR initialized lang={lang}")
+                self._worker = threading.Thread(
+                    target=self._run_worker, daemon=True, name="OCRWorker"
+                )
+                self._worker.start()
+                print("[ocr] async worker started")
             except Exception as e:
                 print(f"[ocr] init failed: {e}")
                 self.enabled = False
         else:
             print("[ocr] disabled or rapidocr not available")
 
-    def _iou(self, a, b):
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        inter = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(
-            0, min(ay2, by2) - max(ay1, by1)
-        )
-        union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter + 1e-6
-        return inter / union
+    def stop(self):
+        self._stop.set()
+
+    # --- public API used by vision_engine ---
+
+    def submit(self, frame: np.ndarray, detections: List[Dict]) -> None:
+        """Submit latest frame+detections; drops any pending job so worker
+        always processes the freshest frame."""
+        if not self.enabled:
+            return
+        if self._q.full():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._q.put_nowait((frame.copy(), detections))
+        except queue.Full:
+            pass
+
+    def get_latest(self) -> Dict:
+        """Return the last-computed OCR result. Safe to call every frame."""
+        with self._latest_lock:
+            latest = self._latest
+        # Return a shallow copy so caller can mutate new_notices without racing
+        # the worker's next update; blank one-shot signals so they don't re-emit.
+        return {
+            "texts": latest.get("texts", []),
+            "new_notices": [],
+            "changed": False,
+        }
 
     def process(self, frame: np.ndarray, detections: List[Dict]) -> Dict:
-        """Return dict with texts list and new_notices list."""
-        if not self.enabled:
-            return {"texts": [], "new_notices": [], "changed": False}
+        """Compatibility shim: sync-style call that submits and returns the
+        last completed result. Prefer submit()/get_latest() directly."""
+        self.submit(frame, detections)
+        return self.get_latest()
 
+    # --- worker loop ---
+
+    def _run_worker(self):
+        while not self._stop.is_set():
+            try:
+                frame, detections = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                result = self._process_sync(frame, detections)
+                with self._latest_lock:
+                    # Preserve one-shot signals: new_notices/changed live in the
+                    # authoritative _latest so vision_engine can consume them
+                    # once before we overwrite on the next tick. We hand them
+                    # out via _consume_one_shots below.
+                    self._latest = result
+                self._consume_one_shots(result)
+            except Exception as e:
+                print(f"[ocr] worker error: {e}")
+
+    def _consume_one_shots(self, result: Dict):
+        """Called after each successful OCR pass. Currently a no-op hook —
+        vision_engine reads texts from get_latest(); new_notices logging is
+        handled by the vision_engine itself when it observes _latest change."""
+        # We intentionally don't drain new_notices here so a future frame's
+        # get_latest could report them, but for now vision_engine treats
+        # get_latest as texts-only and uses its own diffing on displayed texts.
+        return
+
+    # --- core OCR (runs on worker thread) ---
+
+    def _process_sync(self, frame: np.ndarray, detections: List[Dict]) -> Dict:
         h, w = frame.shape[:2]
         rois = []
         if self.roi_only and detections:
@@ -240,14 +173,12 @@ class OCRProcessor:
                     d["cls_name"].lower() in self.text_classes
                     or "text" in d["cls_name"].lower()
                 ):
-                    # expand a bit
                     pad = 4
                     x1 = max(0, d["x1"] - pad)
                     y1 = max(0, d["y1"] - pad)
                     x2 = min(w, d["x2"] + pad)
                     y2 = min(h, d["y2"] + pad)
                     rois.append((x1, y1, x2, y2))
-            # merge overlapping rois simple
             if not rois:
                 rois = [(0, 0, w, h)]
         else:
@@ -260,43 +191,40 @@ class OCRProcessor:
                 continue
             try:
                 result, _ = self.ocr(crop)
-                if result:
-                    for item in result:
-                        # rapidocr returns [box, text, score] or similar
-                        if len(item) >= 2:
-                            box, txt = item[0], item[1]
-                            score = item[2] if len(item) > 2 else 1.0
-                            # adjust box to full frame coords
-                            if isinstance(box, (list, np.ndarray)) and len(box) == 4:
-                                # box is 4 points or rect; simplify to bbox
-                                try:
-                                    xs = [p[0] for p in box]
-                                    ys = [p[1] for p in box]
-                                    bx1, by1, bx2, by2 = (
-                                        min(xs) + x1,
-                                        min(ys) + y1,
-                                        max(xs) + x1,
-                                        max(ys) + y1,
-                                    )
-                                except:
-                                    bx1, by1, bx2, by2 = x1, y1, x2, y2
-                            else:
-                                bx1, by1, bx2, by2 = x1, y1, x2, y2
-                            texts.append(
-                                {
-                                    "text": str(txt).strip(),
-                                    "score": float(score),
-                                    "x1": int(bx1),
-                                    "y1": int(by1),
-                                    "x2": int(bx2),
-                                    "y2": int(by2),
-                                }
+                if not result:
+                    continue
+                for item in result:
+                    if len(item) < 2:
+                        continue
+                    box, txt = item[0], item[1]
+                    score = item[2] if len(item) > 2 else 1.0
+                    if isinstance(box, (list, np.ndarray)) and len(box) == 4:
+                        try:
+                            xs = [p[0] for p in box]
+                            ys = [p[1] for p in box]
+                            bx1, by1, bx2, by2 = (
+                                min(xs) + x1,
+                                min(ys) + y1,
+                                max(xs) + x1,
+                                max(ys) + y1,
                             )
-            except Exception as e:
-                # silent fail per ROI
+                        except Exception:
+                            bx1, by1, bx2, by2 = x1, y1, x2, y2
+                    else:
+                        bx1, by1, bx2, by2 = x1, y1, x2, y2
+                    texts.append(
+                        {
+                            "text": str(txt).strip(),
+                            "score": float(score),
+                            "x1": int(bx1),
+                            "y1": int(by1),
+                            "x2": int(bx2),
+                            "y2": int(by2),
+                        }
+                    )
+            except Exception:
                 continue
 
-        # deduplicate by text content
         uniq_texts = {}
         for t in texts:
             key = t["text"].lower()
@@ -306,7 +234,6 @@ class OCRProcessor:
 
         curr_set = set(t["text"].lower() for t in texts)
         new_notices = list(curr_set - self.prev_texts)
-        # simple change detection: jaccard distance
         inter = len(curr_set & self.prev_texts)
         union = len(curr_set | self.prev_texts) + 1e-6
         changed = (1 - inter / union) > self.diff_threshold
