@@ -99,21 +99,20 @@ class OCRProcessor:
                 self.ocr = ocr_obj
                 print(f"[ocr] RapidOCR initialized lang={lang} use_gpu={use_gpu}")
 
-                # Verify which providers RapidOCR's internal sessions actually
-                # ended up with — walk the object graph looking for any
-                # onnxruntime.InferenceSession instance.
+                # Walk the object graph to find every InferenceSession, remember
+                # its parent+attr so we can reassign, and remember the chain of
+                # ancestors so we can hunt for the .onnx model path.
                 if use_gpu:
                     try:
-                        found = []
+                        import os as _os
+
+                        found = []  # list of (path_str, parent_obj, attr_name, chain)
                         seen = set()
 
-                        def _walk(obj, path, depth=0):
-                            if depth > 4 or id(obj) in seen:
+                        def _walk(obj, path, chain, depth=0):
+                            if depth > 5 or id(obj) in seen:
                                 return
                             seen.add(id(obj))
-                            if isinstance(obj, _orig_session_cls):
-                                found.append((path, obj.get_providers()[0]))
-                                return
                             for name in dir(obj):
                                 if name.startswith("__"):
                                     continue
@@ -121,34 +120,80 @@ class OCRProcessor:
                                     child = getattr(obj, name)
                                 except Exception:
                                     continue
+                                if isinstance(child, _orig_session_cls):
+                                    found.append(
+                                        (f"{path}.{name}", obj, name, chain + [obj])
+                                    )
+                                    continue
                                 if callable(child) and not hasattr(child, "__dict__"):
                                     continue
                                 if isinstance(
                                     child, (str, int, float, bool, bytes, type(None))
                                 ):
                                     continue
-                                _walk(child, f"{path}.{name}", depth + 1)
-
-                        _walk(self.ocr, "ocr")
-                        if found:
-                            summary = ", ".join(
-                                f"{p.split('.')[-1]}={ep.replace('ExecutionProvider','')}"
-                                for p, ep in found
-                            )
-                            print(f"[ocr] session providers after init: {summary}")
-                            on_cpu = [
-                                p for p, ep in found if ep == "CPUExecutionProvider"
-                            ]
-                            if on_cpu:
-                                print(
-                                    f"[ocr] WARNING {len(on_cpu)} session(s) still on CPU: {on_cpu}"
+                                _walk(
+                                    child,
+                                    f"{path}.{name}",
+                                    chain + [obj],
+                                    depth + 1,
                                 )
-                        else:
-                            print(
-                                "[ocr] WARNING no InferenceSession objects found via walk"
-                            )
+
+                        _walk(self.ocr, "ocr", [])
+
+                        def _find_onnx_path(chain):
+                            """Look for an .onnx path across the ancestor chain and their dict attrs."""
+                            for obj in reversed(chain):
+                                for name in dir(obj):
+                                    if name.startswith("__"):
+                                        continue
+                                    try:
+                                        val = getattr(obj, name)
+                                    except Exception:
+                                        continue
+                                    if isinstance(
+                                        val, (str, _os.PathLike)
+                                    ) and str(val).endswith(".onnx"):
+                                        return str(val)
+                                    if isinstance(val, dict):
+                                        for v in val.values():
+                                            if isinstance(
+                                                v, (str, _os.PathLike)
+                                            ) and str(v).endswith(".onnx"):
+                                                return str(v)
+                            return None
+
+                        rebuilt = []
+                        skipped = []
+                        for path_str, parent, attr_name, chain in found:
+                            sess = getattr(parent, attr_name, None)
+                            if sess is None:
+                                continue
+                            providers = sess.get_providers()
+                            if "CUDAExecutionProvider" in providers:
+                                rebuilt.append(f"{path_str}=CUDA(already)")
+                                continue
+                            model_path = _find_onnx_path(chain + [parent])
+                            if not model_path:
+                                skipped.append(f"{path_str}:no-onnx-path")
+                                continue
+                            try:
+                                new_sess = _orig_session_cls(
+                                    model_path, providers=_cuda_providers
+                                )
+                                setattr(parent, attr_name, new_sess)
+                                rebuilt.append(
+                                    f"{path_str}={new_sess.get_providers()[0].replace('ExecutionProvider','')}"
+                                )
+                            except Exception as se:
+                                skipped.append(
+                                    f"{path_str}:{type(se).__name__}:{se}"
+                                )
+                        if rebuilt:
+                            print(f"[ocr] rebuilt sessions: {rebuilt}")
+                        if skipped:
+                            print(f"[ocr] could not rebuild: {skipped}")
                     except Exception as e:
-                        print(f"[ocr] provider verify failed: {e}")
+                        print(f"[ocr] session rebuild failed: {e}")
 
                 # Log which onnx providers RapidOCR actually ended up using
                 try:

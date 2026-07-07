@@ -5,10 +5,22 @@ import warnings
 from typing import List, Dict, Any
 import numpy as np
 
-# The "'half' is deprecated" spam is emitted by Ultralytics' own logger (not the
-# python `warnings` module) once per predict() call — silence it at the source.
+
+# The "'half' is deprecated" spam is emitted once per predict() call. Ultralytics
+# resets its logger level during YOLO() init so setLevel(ERROR) alone gets
+# clobbered. A Filter on the root logger survives level resets because it runs
+# per-record after level checks pass upstream.
+class _DropHalfDeprecated(logging.Filter):
+    def filter(self, record):  # noqa: A003
+        try:
+            return "'half' is deprecated" not in record.getMessage()
+        except Exception:
+            return True
+
+
+for _name in ("ultralytics", "yolo", "YOLO", ""):
+    logging.getLogger(_name).addFilter(_DropHalfDeprecated())
 warnings.filterwarnings("ignore", message=r".*'half' is deprecated.*")
-logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
 try:
     from ultralytics import YOLO
