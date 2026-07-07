@@ -1,10 +1,14 @@
 """Ultralytics YOLO detector + tracker wrapper."""
 
+import logging
 import warnings
 from typing import List, Dict, Any
 import numpy as np
 
+# The "'half' is deprecated" spam is emitted by Ultralytics' own logger (not the
+# python `warnings` module) once per predict() call — silence it at the source.
 warnings.filterwarnings("ignore", message=r".*'half' is deprecated.*")
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
 try:
     from ultralytics import YOLO

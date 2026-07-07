@@ -40,85 +40,115 @@ class OCRProcessor:
         self.use_gpu = use_gpu
         if self.enabled:
             try:
-                # RapidOCR auto-selects GPU via onnxruntime if available
-                # Try multiple API signatures across rapidocr versions to force GPU and lang
-                ocr_obj = None
-                last_err = None
-                # candidate kwargs in order of likelihood across versions
-                candidates = [
-                    {"lang": lang, "device": "cuda" if use_gpu else "cpu"},
-                    {"lang": lang, "use_cuda": use_gpu},
-                    {"lang": lang, "use_gpu": use_gpu},
-                    {"lang": lang},
-                    {"device": "cuda" if use_gpu else "cpu"},
-                    {"use_cuda": use_gpu},
-                    {},
+                # rapidocr-onnxruntime ignores use_gpu/device/use_cuda kwargs in most
+                # versions and constructs its internal ONNX sessions with
+                # CPUExecutionProvider only. To force GPU without reaching into version-
+                # specific internals, monkey-patch ort.InferenceSession before RapidOCR
+                # init so every session it creates gets CUDA providers by default.
+                import onnxruntime as ort
+
+                _orig_session_cls = ort.InferenceSession
+                _cuda_providers = [
+                    "CUDAExecutionProvider",
+                    "CPUExecutionProvider",
                 ]
-                for kw in candidates:
-                    try:
-                        ocr_obj = RapidOCR(**kw)
-                        break
-                    except TypeError as te:
-                        last_err = te
-                        continue
-                    except Exception as e:
-                        last_err = e
-                        continue
-                if ocr_obj is None:
-                    raise RuntimeError(
-                        f"RapidOCR init failed with all signatures, last error: {last_err}"
-                    )
+
+                def _forced_cuda_session(*args, **kwargs):
+                    prov = kwargs.get("providers")
+                    if (
+                        not prov
+                        or "CUDAExecutionProvider" not in prov
+                        and "TensorrtExecutionProvider" not in prov
+                    ):
+                        kwargs["providers"] = _cuda_providers
+                    return _orig_session_cls(*args, **kwargs)
+
+                if use_gpu and "CUDAExecutionProvider" in ort.get_available_providers():
+                    ort.InferenceSession = _forced_cuda_session
+
+                try:
+                    ocr_obj = None
+                    last_err = None
+                    candidates = [
+                        {"lang": lang, "device": "cuda" if use_gpu else "cpu"},
+                        {"lang": lang, "use_cuda": use_gpu},
+                        {"lang": lang, "use_gpu": use_gpu},
+                        {"lang": lang},
+                        {"device": "cuda" if use_gpu else "cpu"},
+                        {"use_cuda": use_gpu},
+                        {},
+                    ]
+                    for kw in candidates:
+                        try:
+                            ocr_obj = RapidOCR(**kw)
+                            break
+                        except TypeError as te:
+                            last_err = te
+                            continue
+                        except Exception as e:
+                            last_err = e
+                            continue
+                    if ocr_obj is None:
+                        raise RuntimeError(
+                            f"RapidOCR init failed with all signatures, last error: {last_err}"
+                        )
+                finally:
+                    # Always restore, even on failure.
+                    ort.InferenceSession = _orig_session_cls
+
                 self.ocr = ocr_obj
                 print(f"[ocr] RapidOCR initialized lang={lang} use_gpu={use_gpu}")
 
-                # rapidocr-onnxruntime ignores use_gpu/device kwargs in most versions,
-                # so the internal ONNX sessions default to CPU even when onnxruntime-gpu
-                # is installed. Force each sub-model's session to CUDA by rebuilding it
-                # with explicit providers, using whichever model_path attribute the
-                # installed version exposes.
+                # Verify which providers RapidOCR's internal sessions actually
+                # ended up with — walk the object graph looking for any
+                # onnxruntime.InferenceSession instance.
                 if use_gpu:
                     try:
-                        import onnxruntime as ort
+                        found = []
+                        seen = set()
 
-                        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                        swapped = []
-                        failed = []
-                        for attr in ["text_det", "text_rec", "text_cls"]:
-                            sub = getattr(self.ocr, attr, None)
-                            if sub is None:
-                                continue
-                            sess = getattr(sub, "session", None)
-                            if sess is None:
-                                continue
-                            model_path = None
-                            for candidate in [
-                                getattr(sub, "_model_path", None),
-                                getattr(sub, "model_path", None),
-                                getattr(sess, "_model_path", None),
-                            ]:
-                                if candidate:
-                                    model_path = candidate
-                                    break
-                            if not model_path:
-                                failed.append(f"{attr}:no-model-path")
-                                continue
-                            try:
-                                sub.session = ort.InferenceSession(
-                                    str(model_path), providers=providers
+                        def _walk(obj, path, depth=0):
+                            if depth > 4 or id(obj) in seen:
+                                return
+                            seen.add(id(obj))
+                            if isinstance(obj, _orig_session_cls):
+                                found.append((path, obj.get_providers()[0]))
+                                return
+                            for name in dir(obj):
+                                if name.startswith("__"):
+                                    continue
+                                try:
+                                    child = getattr(obj, name)
+                                except Exception:
+                                    continue
+                                if callable(child) and not hasattr(child, "__dict__"):
+                                    continue
+                                if isinstance(
+                                    child, (str, int, float, bool, bytes, type(None))
+                                ):
+                                    continue
+                                _walk(child, f"{path}.{name}", depth + 1)
+
+                        _walk(self.ocr, "ocr")
+                        if found:
+                            summary = ", ".join(
+                                f"{p.split('.')[-1]}={ep.replace('ExecutionProvider','')}"
+                                for p, ep in found
+                            )
+                            print(f"[ocr] session providers after init: {summary}")
+                            on_cpu = [
+                                p for p, ep in found if ep == "CPUExecutionProvider"
+                            ]
+                            if on_cpu:
+                                print(
+                                    f"[ocr] WARNING {len(on_cpu)} session(s) still on CPU: {on_cpu}"
                                 )
-                                swapped.append(
-                                    f"{attr}:{sub.session.get_providers()[0]}"
-                                )
-                            except Exception as se:
-                                failed.append(f"{attr}:{type(se).__name__}")
-                        if swapped:
-                            print(f"[ocr] forced GPU sessions: {swapped}")
-                        if failed:
+                        else:
                             print(
-                                f"[ocr] could not force some sessions to GPU: {failed}"
+                                "[ocr] WARNING no InferenceSession objects found via walk"
                             )
                     except Exception as e:
-                        print(f"[ocr] GPU force step failed: {e}")
+                        print(f"[ocr] provider verify failed: {e}")
 
                 # Log which onnx providers RapidOCR actually ended up using
                 try:
