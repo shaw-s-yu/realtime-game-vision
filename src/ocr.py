@@ -40,11 +40,15 @@ class OCRProcessor:
         self.use_gpu = use_gpu
         if self.enabled:
             try:
-                # rapidocr-onnxruntime ignores use_gpu/device/use_cuda kwargs in most
-                # versions and constructs its internal ONNX sessions with
-                # CPUExecutionProvider only. To force GPU without reaching into version-
-                # specific internals, monkey-patch ort.InferenceSession before RapidOCR
-                # init so every session it creates gets CUDA providers by default.
+                # rapidocr-onnxruntime constructs its internal ONNX sessions with
+                # CPUExecutionProvider only, ignoring use_gpu/device/use_cuda kwargs.
+                # It also imports InferenceSession via `from onnxruntime import
+                # InferenceSession` inside its own submodules — so patching
+                # ort.InferenceSession alone doesn't intercept it. Instead, patch
+                # the InferenceSession attribute on every already-imported
+                # rapidocr_onnxruntime submodule before calling RapidOCR(), then
+                # restore it after.
+                import sys
                 import onnxruntime as ort
 
                 _orig_session_cls = ort.InferenceSession
@@ -54,17 +58,30 @@ class OCRProcessor:
                 ]
 
                 def _forced_cuda_session(*args, **kwargs):
-                    prov = kwargs.get("providers")
-                    if (
-                        not prov
-                        or "CUDAExecutionProvider" not in prov
-                        and "TensorrtExecutionProvider" not in prov
-                    ):
-                        kwargs["providers"] = _cuda_providers
+                    kwargs["providers"] = _cuda_providers
                     return _orig_session_cls(*args, **kwargs)
 
-                if use_gpu and "CUDAExecutionProvider" in ort.get_available_providers():
+                patched = []
+                if (
+                    use_gpu
+                    and "CUDAExecutionProvider" in ort.get_available_providers()
+                ):
+                    # Patch the module-level reference in onnxruntime itself...
                     ort.InferenceSession = _forced_cuda_session
+                    patched.append(("onnxruntime", _orig_session_cls))
+                    # ...and every rapidocr_onnxruntime submodule already imported
+                    # that has an InferenceSession attribute bound at module level
+                    # via `from onnxruntime import InferenceSession`.
+                    for mod_name, mod in list(sys.modules.items()):
+                        if not mod_name.startswith("rapidocr_onnxruntime"):
+                            continue
+                        cur = getattr(mod, "InferenceSession", None)
+                        if cur is _orig_session_cls:
+                            setattr(mod, "InferenceSession", _forced_cuda_session)
+                            patched.append((mod_name, _orig_session_cls))
+                    print(
+                        f"[ocr] patched InferenceSession in {len(patched)} module(s) before RapidOCR init"
+                    )
 
                 try:
                     ocr_obj = None
@@ -93,23 +110,25 @@ class OCRProcessor:
                             f"RapidOCR init failed with all signatures, last error: {last_err}"
                         )
                 finally:
-                    # Always restore, even on failure.
-                    ort.InferenceSession = _orig_session_cls
+                    # Restore every patched module attribute.
+                    for mod_name, orig in patched:
+                        target = ort if mod_name == "onnxruntime" else sys.modules.get(
+                            mod_name
+                        )
+                        if target is not None:
+                            setattr(target, "InferenceSession", orig)
 
                 self.ocr = ocr_obj
                 print(f"[ocr] RapidOCR initialized lang={lang} use_gpu={use_gpu}")
 
-                # Walk the object graph to find every InferenceSession, remember
-                # its parent+attr so we can reassign, and remember the chain of
-                # ancestors so we can hunt for the .onnx model path.
+                # Verify: walk the ocr object graph and report the providers each
+                # InferenceSession actually ended up with.
                 if use_gpu:
                     try:
-                        import os as _os
-
-                        found = []  # list of (path_str, parent_obj, attr_name, chain)
+                        found = []
                         seen = set()
 
-                        def _walk(obj, path, chain, depth=0):
+                        def _walk(obj, path, depth=0):
                             if depth > 5 or id(obj) in seen:
                                 return
                             seen.add(id(obj))
@@ -122,7 +141,7 @@ class OCRProcessor:
                                     continue
                                 if isinstance(child, _orig_session_cls):
                                     found.append(
-                                        (f"{path}.{name}", obj, name, chain + [obj])
+                                        (f"{path}.{name}", child.get_providers()[0])
                                     )
                                     continue
                                 if callable(child) and not hasattr(child, "__dict__"):
@@ -131,69 +150,24 @@ class OCRProcessor:
                                     child, (str, int, float, bool, bytes, type(None))
                                 ):
                                     continue
-                                _walk(
-                                    child,
-                                    f"{path}.{name}",
-                                    chain + [obj],
-                                    depth + 1,
-                                )
+                                _walk(child, f"{path}.{name}", depth + 1)
 
-                        _walk(self.ocr, "ocr", [])
-
-                        def _find_onnx_path(chain):
-                            """Look for an .onnx path across the ancestor chain and their dict attrs."""
-                            for obj in reversed(chain):
-                                for name in dir(obj):
-                                    if name.startswith("__"):
-                                        continue
-                                    try:
-                                        val = getattr(obj, name)
-                                    except Exception:
-                                        continue
-                                    if isinstance(
-                                        val, (str, _os.PathLike)
-                                    ) and str(val).endswith(".onnx"):
-                                        return str(val)
-                                    if isinstance(val, dict):
-                                        for v in val.values():
-                                            if isinstance(
-                                                v, (str, _os.PathLike)
-                                            ) and str(v).endswith(".onnx"):
-                                                return str(v)
-                            return None
-
-                        rebuilt = []
-                        skipped = []
-                        for path_str, parent, attr_name, chain in found:
-                            sess = getattr(parent, attr_name, None)
-                            if sess is None:
-                                continue
-                            providers = sess.get_providers()
-                            if "CUDAExecutionProvider" in providers:
-                                rebuilt.append(f"{path_str}=CUDA(already)")
-                                continue
-                            model_path = _find_onnx_path(chain + [parent])
-                            if not model_path:
-                                skipped.append(f"{path_str}:no-onnx-path")
-                                continue
-                            try:
-                                new_sess = _orig_session_cls(
-                                    model_path, providers=_cuda_providers
+                        _walk(self.ocr, "ocr")
+                        if found:
+                            summary = ", ".join(
+                                f"{p.split('.')[-1]}={ep.replace('ExecutionProvider', '')}"
+                                for p, ep in found
+                            )
+                            print(f"[ocr] session providers after init: {summary}")
+                            on_cpu = [
+                                p for p, ep in found if ep == "CPUExecutionProvider"
+                            ]
+                            if on_cpu:
+                                print(
+                                    f"[ocr] WARNING {len(on_cpu)} session(s) still on CPU: {on_cpu}"
                                 )
-                                setattr(parent, attr_name, new_sess)
-                                rebuilt.append(
-                                    f"{path_str}={new_sess.get_providers()[0].replace('ExecutionProvider','')}"
-                                )
-                            except Exception as se:
-                                skipped.append(
-                                    f"{path_str}:{type(se).__name__}:{se}"
-                                )
-                        if rebuilt:
-                            print(f"[ocr] rebuilt sessions: {rebuilt}")
-                        if skipped:
-                            print(f"[ocr] could not rebuild: {skipped}")
                     except Exception as e:
-                        print(f"[ocr] session rebuild failed: {e}")
+                        print(f"[ocr] provider verify failed: {e}")
 
                 # Log which onnx providers RapidOCR actually ended up using
                 try:
